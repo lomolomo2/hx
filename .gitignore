@@ -3,3 +3,8 @@ engine/build*/
 host/dist/
 *.log
 .DS_Store
+dist/
+
+# 沙箱把 USERPROFILE 指向工作区，于是 Windows 把 AppContainer 自己的
+# 重定向写入落在这里。是运行产物，不是源码。
+AppData/

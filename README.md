@@ -98,6 +98,11 @@ npx tsx src/cli.ts --root /path/to/repo                             # 交互式
 
 ### Windows：当成一条命令用
 
+> Windows 上的完整说明（装、配、验、排错、沙箱边界）在
+> **[docs/windows.md](docs/windows.md)**。不想从源码构建的话，
+> [Releases](https://github.com/lomolomo2/hx/releases) 有打好的包，
+> 解开加进 PATH 就能用（引擎是原生二进制，宿主需要 Node 20+）。
+
 仓库根的 `hx.ps1` / `hx.cmd` 是个启动器，把这个目录加进 `PATH` 之后：
 
 ```powershell

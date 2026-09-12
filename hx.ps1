@@ -31,21 +31,71 @@ param(
   [int]$MaxSteps = 20,
   [int]$ContextWindow = 0,
   [string[]]$ReadPath = @(),
-  [string]$CaCert = ""
+  [string]$CaCert = "",
+  [switch]$Caps
 )
 
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
-$hxd = Join-Path $repo "engine\build\hxd.exe"
-# ★ 不能用 `npx tsx`：npx 从**当前目录**往上找 node_modules，而 hx 就是要在
-#   别人的仓库里跑。直接指向 host 自己的 tsx，才和 cwd 无关。
-$tsx = Join-Path $repo "host\node_modules\.bin\tsx.cmd"
 
-if (-not (Test-Path $hxd)) {
-  Write-Host "hxd.exe 不在，先构建..." -ForegroundColor Yellow
-  pwsh -NoProfile -File (Join-Path $repo "engine\build-win.ps1")
+# 两种布局：解包后的发布版（hxd.exe 和打好的 bundle 就在旁边），
+# 和仓库工作树（引擎要构建，宿主走 tsx 跑 TypeScript 源码）。
+$packagedEngine = Join-Path $repo "hxd.exe"
+$packagedHost = Join-Path $repo "host\hx-host.mjs"
+$packaged = (Test-Path $packagedEngine) -and (Test-Path $packagedHost)
+
+if ($packaged) {
+  $hxd = $packagedEngine
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    throw "hx 需要 Node.js 20+（引擎是原生的，宿主是 JS）。https://nodejs.org"
+  }
+  $runner = "node"
+  $entry = $packagedHost
+} else {
+  $hxd = Join-Path $repo "engine\build\hxd.exe"
+  if (-not (Test-Path $hxd)) {
+    Write-Host "hxd.exe 不在，先构建..." -ForegroundColor Yellow
+    pwsh -NoProfile -File (Join-Path $repo "engine\build-win.ps1")
+  }
+  # ★ 不能用 `npx tsx`：npx 从**当前目录**往上找 node_modules，而 hx 就是要在
+  #   别人的仓库里跑。直接指向 host 自己的 tsx，才和 cwd 无关。
+  $runner = Join-Path $repo "host\node_modules\.bin\tsx.cmd"
+  if (-not (Test-Path $runner)) { throw "tsx 不在：先在 $repo\host 里跑一次 npm install" }
+  $entry = Join-Path $repo "host\src\cli.ts"
 }
-if (-not (Test-Path $tsx)) { throw "tsx 不在：先在 $repo\host 里跑一次 npm install" }
+
+# ★ 必须显式告诉宿主引擎在哪。宿主默认按自己的位置往上找
+#   ../../engine/build/hxd.exe —— 那是仓库布局，发布包里根本不成立。
+$env:HX_ENGINE = $hxd
+
+# ---------------------------------------------------------------- 自检
+# 放在读配置**之前**：验证装没装好这件事不该要求你先配好一个模型端点。
+if ($Caps) {
+  $json = & $hxd --self-test
+  $code = $LASTEXITCODE
+  $json | ConvertFrom-Json | ConvertTo-Json -Depth 6
+  Write-Host ""
+  if ($code -eq 0) { Write-Host "退出码 0 = 这台机器上有真沙箱" -ForegroundColor Green }
+  else { Write-Host "退出码 $code = 没有真沙箱（引擎如实上报，不会假装安全）" -ForegroundColor Red }
+  exit $code
+}
+
+# ★ 认不出来的 -Flag 必须当场报错，不能当成任务扔给模型。
+#
+#   $Task 带 ValueFromRemainingArguments，什么都接得住 —— 包括打错的开关。
+#   实测 `hx -Caps`（当时还没有这个开关）被整条当成了**任务提示词**：
+#   模型于是认真地去研究"怎么执行 -Caps"，跑满步数、烧掉三十多万 token，
+#   还给出了一段煞有介事但完全错误的根因分析。
+#   一个拼错的开关不该变成一次真实的模型运行。
+if ($Task -and $Task[0].StartsWith("-")) {
+  Write-Host "不认识的开关：$($Task[0])" -ForegroundColor Red
+  Write-Host ""
+  Write-Host "可用开关：-Caps -Root -Net -Sandbox -Approval -MaxSteps -ReadPath"
+  Write-Host "          -BaseUrl -Model -ApiKey -ContextWindow -CaCert"
+  Write-Host ""
+  Write-Host "任务本身要带引号：hx `"把 tests 里失败的用例修好`""
+  exit 64
+}
 
 # ------------------------------------------------------------------ 配置
 $cfgPath = Join-Path $env:USERPROFILE ".hx\config.json"
@@ -97,7 +147,7 @@ if (-not $Root) { $Root = (Get-Location).Path }
 $Root = (Resolve-Path $Root).Path
 
 $argv = @(
-  (Join-Path $repo "host\src\cli.ts")
+  $entry
   "--root", $Root
   "--sandbox", $Sandbox
   "--net", $Net
@@ -106,5 +156,5 @@ $argv = @(
 foreach ($p in $ReadPath) { $argv += @("--read-path", (Resolve-Path $p).Path) }
 if ($Task) { $argv += ($Task -join " ") }
 
-& $tsx @argv
+& $runner @argv
 exit $LASTEXITCODE
