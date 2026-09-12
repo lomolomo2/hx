@@ -83,7 +83,21 @@ Copy-Item $hxd (Join-Path $staging "hxd.exe")
 Copy-Item (Join-Path $repo "hx.cmd") $staging
 Copy-Item (Join-Path $repo "hx.ps1") $staging
 Copy-Item (Join-Path $repo "LICENSE") $staging
-Copy-Item (Join-Path $repo "docs\windows.md") (Join-Path $staging "README.md")
+# ★ The language switcher at the top of docs\windows.md is a *relative* link to
+#   windows.zh-CN.md, and that file is not in the package -- shipped as-is it is
+#   a dead link. Rewrite it to the canonical URL on the way in, rather than
+#   dropping the line: someone reading the packaged guide should still be able
+#   to find the Chinese version.
+$doc = Get-Content (Join-Path $repo "docs\windows.md") -Raw
+$doc = $doc.Replace(
+  "[中文](windows.zh-CN.md)",
+  "[中文](https://github.com/lomolomo2/hx/blob/main/docs/windows.zh-CN.md)")
+# The "more detail is in the README" link is relative to docs/ in the repo, and
+# equally dead once this file sits alone at the package root.
+$doc = $doc.Replace(
+  "[README](../README.md)",
+  "[README](https://github.com/lomolomo2/hx/blob/main/README.md)")
+Set-Content -Path (Join-Path $staging "README.md") -Value $doc -Encoding utf8 -NoNewline
 
 Write-Host ""
 Write-Host "== package contents ==" -ForegroundColor Cyan
