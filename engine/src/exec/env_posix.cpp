@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "exec/env.hpp"
 
 namespace hx {
@@ -19,3 +20,4 @@ std::vector<std::string> BuildMinimalEnv(const std::string& home, const std::str
 }
 
 }  // namespace hx
+#endif  // !_WIN32

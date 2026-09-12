@@ -67,6 +67,14 @@ export interface SandboxReport {
   net: string;
   enforced: boolean;
   netEnforced: boolean;
-  landlockAbi: number;
+  /**
+   * 内核这一侧到底是谁在强制："landlock" / "appcontainer" / "none"。
+   *
+   * ★ 原来这里是 landlockAbi: number。那是把一个平台专有的实现细节
+   *   焊进了协议 —— 宿主要判断的一直是「这次有没有真沙箱」，
+   *   而不是「用的哪套内核接口、第几版」。想看细节的话，
+   *   rollout 第一条 session_meta 里有完整的 caps。
+   */
+  backend: string;
   warnings: string[];
 }

@@ -1,7 +1,12 @@
 // Engine —— hxd 的事件循环与操作分发。
 //
-// 单线程 epoll：stdin（宿主请求）+ 所有 cell 的管道 fd + 定时器（wait 截止/进程超时）
-// 都在同一个循环里。没有线程，因此没有锁，也没有竞态。
+// 单线程 reactor：stdin（宿主请求）+ 所有 cell 的流 + 定时器（wait 截止/进程超时）
+// 都在同一个循环里。引擎状态只被这一个线程改，因此没有锁，也没有竞态。
+//
+// ★ 平台差异只藏在 io::Reactor 后面（Linux epoll / Windows IOCP），
+//   下面这些逻辑一行都不该因为换了操作系统而分叉。
+//   唯一的例外记在 io_win.cpp 顶部：Windows 上 stdio 由两个搬字节的线程驱动，
+//   因为宿主给的标准句柄是同步的、进不了 IOCP。那两个线程不碰这里的任何状态。
 #pragma once
 
 #include <cstdint>
@@ -13,10 +18,12 @@
 #include <vector>
 
 #include "exec/cell.hpp"
+#include "exec/proc.hpp"
+#include "io/io.hpp"
 #include "log/rollout.hpp"
 #include "proto.hpp"
 #include "sandbox/caps.hpp"
-#include "sandbox/landlock.hpp"
+#include "sandbox/confine.hpp"
 #include "sandbox/policy.hpp"
 
 namespace hx {
@@ -68,11 +75,11 @@ class Engine {
 
   // 事件循环内部
   int ComputeTimeoutMs() const;
-  void OnCellFdReadable(int fd);
-  void CloseCellFd(Cell* c, int fd);
+  void OnCellFdReadable(io::Fd fd);
+  void CloseCellFd(Cell* c, io::Fd fd);
   void ReapChildren();
   void EnforceDeadlines();
-  void ScheduleKill(pid_t pgid);
+  void ScheduleKill(const Proc& p);
   void SweepKills();
   void ServicePendingWaits();
   json BuildWaitReply(const std::string& req_id, Cell* c, size_t max_bytes);
@@ -109,7 +116,7 @@ class Engine {
    *   把清理绑在汇报生命周期上，结果就是「cell 结束了、进程还在」。
    */
   struct PendingKill {
-    pid_t pgid;
+    Proc proc;  // 自己持有一份组句柄，与 cell 的生命周期解耦
     int sweeps_left;
     int64_t next_sweep_ms;
   };
@@ -118,11 +125,11 @@ class Engine {
   Rollout rollout_;
   CellTable cells_;
   std::vector<PendingWait> waits_;
-  int ep_ = -1;
+  io::Reactor reactor_;
   bool running_ = true;
 
   std::string out_buf_;
-  bool out_watched_ = false;   // stdout 是否已注册 EPOLLOUT
+  bool out_watched_ = false;   // stdout 是否已挂上「关注可写」
   uint64_t dropped_events_ = 0;
 };
 

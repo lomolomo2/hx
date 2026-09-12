@@ -8,6 +8,7 @@ import { ScriptedModelClient, callTool, say } from "../src/model/scripted.js";
 import { ToolRegistry, defaultTools } from "../src/tools/registry.js";
 import type { ThreadEvent } from "../src/protocol/events.js";
 import type { AssistantTurn } from "../src/model/types.js";
+import { fixture } from "./fixtures.js";
 
 const ws = process.argv[2];
 const hxd = process.argv[3] ?? "../engine/build/hxd";
@@ -16,14 +17,6 @@ if (!ws) {
   process.exit(64);
 }
 
-const PATCH = `*** Begin Patch
-*** Update File: calc.py
-@@
- def add(a, b):
--    return a - b
-+    return a + b
-*** End Patch
-`;
 
 // 模型的剧本：立计划 → 跑测试(失败) → 读文件 → 打补丁 → 再跑(通过) → 收尾
 const script = (_msgs: unknown, step: number): AssistantTurn => {
@@ -36,15 +29,14 @@ const script = (_msgs: unknown, step: number): AssistantTurn => {
         ],
       });
     case 1:
-      // -B：不写 .pyc。补丁把 "a - b" 改成 "a + b" 字节数不变，若又落在同一秒内，
-      // Python 的 (mtime秒, size) 校验会判定缓存有效 —— 改对了却仍报失败。
-      return callTool("c1", "bash", { cmd: "python3 -B test_calc.py" });
+      // 跑测试的命令随平台变，见 test/fixtures.ts 里挑解释器的理由。
+      return callTool("c1", "bash", { cmd: fixture.runCommand });
     case 2:
       return callTool("c2", "read", { path: "calc.py" });
     case 3:
-      return callTool("c3", "apply_patch", { patch: PATCH });
+      return callTool("c3", "apply_patch", { patch: fixture.patch });
     case 4:
-      return callTool("c4", "bash", { cmd: "python3 -B test_calc.py" });
+      return callTool("c4", "bash", { cmd: fixture.runCommand });
     case 5:
       return callTool("c5", "todo", {
         items: [
@@ -85,15 +77,15 @@ const patches = events.flatMap((e) =>
 console.log();
 check("走到了最终回复", result.stoppedBecause === "final_message", result.stoppedBecause);
 check("第一次跑测试失败", cmds[0]?.exitCode !== 0, `exit=${cmds[0]?.exitCode}`);
-check("补丁落盘成功", patches[0]?.status === "completed" && patches[0]?.changes[0]?.path === "calc.py");
+check("补丁落盘成功", patches[0]?.status === "completed" && patches[0]?.changes[0]?.path === fixture.sourceName);
 check("修完后测试通过", cmds[1]?.exitCode === 0, `exit=${cmds[1]?.exitCode} out=${cmds[1]?.output?.slice(0, 80)}`);
 check("沙箱确实生效", agent.sandbox?.enforced === true);
 check("有 thread.started 事件", events[0]?.type === "thread.started");
 check("循环结束时回到 settling", agent.phase === "settling");
 
 // 文件真的被改了（经引擎读回，宿主自己不碰 fs）
-const after = await engine.fsRead("calc.py");
-check("文件内容确实变成了 a + b", after.content.includes("return a + b"));
+const after = await engine.fsRead(fixture.sourceName);
+check("文件内容确实变成了 a + b", after.content.includes(fixture.fixedMarker));
 
 // 两条流分离：给模型的历史里不含 UI 事件
 const historyRoles = agent.history.map((m) => m.role);

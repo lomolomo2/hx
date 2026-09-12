@@ -1,5 +1,7 @@
 #include "sandbox/policy.hpp"
 
+#include "sandbox/seccomp.hpp"
+
 namespace hx {
 
 bool ParseSandboxMode(std::string_view s, SandboxMode* out) {
@@ -72,6 +74,16 @@ const std::vector<std::string>& DefaultWritableDevices() {
       "/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/pts", "/dev/ptmx",
   };
   return kPaths;
+}
+
+SeccompPlan PlanFor(const Policy& p) {
+  SeccompPlan plan;
+  // Landlock 只管 TCP。要真的断网，Linux 侧必须在这里把 AF_INET/AF_INET6 的
+  // socket() 一起封掉 —— 否则 UDP（含 DNS）畅通无阻。
+  // Windows 侧不看这个字段：AppContainer 不给 internetClient 时 WFP 全挡。
+  plan.block_inet = (p.net == NetMode::kDeny);
+  plan.block_admin = (p.sandbox != SandboxMode::kDangerFullAccess);
+  return plan;
 }
 
 }  // namespace hx

@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "exec/rlimit.hpp"
 
 #include <dirent.h>
@@ -33,7 +34,7 @@ bool SetOne(int resource, uint64_t value, const char* name, std::string* err) {
 
 }  // namespace
 
-uint64_t CountUserTasks(uid_t uid) {
+uint64_t CountUserTasks(unsigned uid) {
   DIR* proc = ::opendir("/proc");
   if (proc == nullptr) return 0;
 
@@ -67,7 +68,7 @@ uint64_t CountUserTasks(uid_t uid) {
 
 Limits LimitsFor(uint64_t headroom) {
   Limits l;
-  const uint64_t current = CountUserTasks(::getuid());
+  const uint64_t current = CountUserTasks(static_cast<unsigned>(::getuid()));
   // 数不出来就不设上限：猜低了整个沙箱不可用，而 fork 炸弹还有
   // timeout + kill(-pgid) 兜底。宁可少一道缓解，不可让工具全线失灵。
   l.max_processes = current > 0 ? current + headroom : 0;
@@ -94,3 +95,4 @@ bool ApplyLimits(const Limits& l, std::string* err) {
 }
 
 }  // namespace hx
+#endif  // !_WIN32

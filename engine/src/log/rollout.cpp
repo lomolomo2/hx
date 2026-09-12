@@ -1,45 +1,13 @@
 #include "log/rollout.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "platform/platform.hpp"
 
-#include <cerrno>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
+#include <cstdio>
 
 namespace hx {
 namespace {
 
-bool MkdirP(const std::string& path, std::string* err) {
-  std::string acc;
-  size_t i = 0;
-  while (i < path.size()) {
-    const size_t slash = path.find('/', i + 1);
-    acc = (slash == std::string::npos) ? path : path.substr(0, slash);
-    if (::mkdir(acc.c_str(), 0700) != 0 && errno != EEXIST) {
-      *err = "mkdir " + acc + ": " + ::strerror(errno);
-      return false;
-    }
-    if (slash == std::string::npos) break;
-    i = slash;
-  }
-  return true;
-}
-
-std::string TwoDigit(int v) {
-  char b[16];
-  ::snprintf(b, sizeof(b), "%02d", v);
-  return b;
-}
-
-int64_t NowUnixMs() {
-  struct timespec ts {};
-  ::clock_gettime(CLOCK_REALTIME, &ts);
-  return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
-}
+int64_t NowUnixMs() { return platform::UnixNowMs(); }
 
 }  // namespace
 
@@ -63,32 +31,26 @@ bool Rollout::Open(const std::string& base, const std::string& name, std::string
 
   std::string root = base;
   if (root.empty()) {
-    const char* home = ::getenv("HOME");
-    if (home == nullptr) {
-      *err = "HOME is not set and no base given";
+    const std::string home = platform::HomeDir();
+    if (home.empty() || home == ".") {
+      *err = "no home directory and no base given";
       return false;
     }
-    root = std::string(home) + "/.hx/sessions";
+    root = platform::Join(platform::Join(home, ".hx"), "sessions");
   }
 
-  const time_t now = ::time(nullptr);
-  struct tm tm_buf {};
-  ::localtime_r(&now, &tm_buf);
-  const std::string dir = root + "/" + std::to_string(1900 + tm_buf.tm_year) + "/" +
-                          TwoDigit(tm_buf.tm_mon + 1) + "/" + TwoDigit(tm_buf.tm_mday);
-  if (!MkdirP(dir, err)) return false;
+  // LocalDatePath 给的是 YYYY/MM/DD 形式，直接 Join 会拼出混着两种分隔符的
+  // 路径（前半截反斜杠、后半截正斜杠）。能用，但日志里看着像 bug，
+  // 而且拿去和 roots 比较时会对不上 —— 统一成本平台的分隔符。
+  const std::string dir = platform::Normalize(platform::Join(root, platform::LocalDatePath()));
+  if (!platform::MakeDirs(dir, err)) return false;
 
-  path_ = dir + "/rollout-" + name + ".jsonl";
-  fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-  if (fd_ < 0) {
-    *err = "open " + path_ + ": " + ::strerror(errno);
-    return false;
-  }
-  return true;
+  path_ = platform::Join(dir, "rollout-" + name + ".jsonl");
+  return file_.Open(path_, err);
 }
 
 int64_t Rollout::Append(const json& record) {
-  if (fd_ < 0) return -1;
+  if (!file_.valid()) return -1;
 
   json line = record;
   line["seq"] = ++seq_;
@@ -97,23 +59,13 @@ int64_t Rollout::Append(const json& record) {
   std::string s = line.dump();
   s.push_back('\n');
 
-  // 一次 write() 追加：进程中途被杀也不会留下半行。
-  // 短写在常规文件上极罕见，但真发生了必须如实上报，不能假装成功。
-  const ssize_t n = ::write(fd_, s.data(), s.size());
-  if (n < 0 || static_cast<size_t>(n) != s.size()) {
-    return -1;
-  }
+  // 一次写追加：进程中途被杀也不会留下半行。见 platform::AppendFile。
+  if (!file_.WriteRecord(s)) return -1;
   return seq_;
 }
 
-bool Rollout::Flush() { return fd_ >= 0 && ::fsync(fd_) == 0; }
+bool Rollout::Flush() { return file_.Sync(); }
 
-void Rollout::Close() {
-  if (fd_ >= 0) {
-    ::fsync(fd_);
-    ::close(fd_);
-    fd_ = -1;
-  }
-}
+void Rollout::Close() { file_.Close(); }
 
 }  // namespace hx
