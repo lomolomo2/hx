@@ -5,6 +5,8 @@
 //   node scripts/transcript.mjs path/to.jsonl   # by path
 //   node scripts/transcript.mjs --list          # what sessions exist
 //   node scripts/transcript.mjs s6468 --full    # do not truncate anything
+//   node scripts/transcript.mjs s6468 --prompts # dump what was sent to the model
+//                                               # (only if the run had HX_LOG_PROMPTS=1)
 //
 // ★ Why this exists. The rollout already holds every step of a run, but it is
 //   JSONL built for machines: one record per line, tool calls and their results
@@ -13,11 +15,13 @@
 //   one compressed 19 tool calls into "2 steps" and described results it had
 //   not checked. The data was right there; only a reader was missing.
 //
-// ★ What a rollout does NOT contain: the exact text sent to the model. The
+// ★ By default a rollout does NOT contain the text sent to the model. The
 //   prompt is assembled fresh each step by buildPrompt() (system prompt +
-//   world snapshot + history) and never written to disk. What is recorded is
-//   the history itself -- what the model said and what it got back. This tool
-//   does not pretend otherwise; see the note it prints at the end.
+//   world snapshot + history) and thrown away; what is recorded is the
+//   conversation -- what the model said and what it got back.
+//   Run with HX_LOG_PROMPTS=1 and each call is additionally written as a
+//   `model_call` record, which --prompts renders here. The tool says which of
+//   the two it is looking at rather than letting a reader assume.
 //
 // Dependency-free on purpose: it has to run from a bare clone, before any
 // npm install.
@@ -28,6 +32,7 @@ import { homedir } from "node:os";
 const argv = process.argv.slice(2);
 const full = argv.includes("--full");
 const wantList = argv.includes("--list");
+const wantPrompts = argv.includes("--prompts");
 const target = argv.find((a) => !a.startsWith("--"));
 
 const SESSIONS = join(homedir(), ".hx", "sessions");
@@ -150,7 +155,7 @@ for (const line of lines) {
   }
 }
 
-const stats = { calls: 0, byTool: new Map(), compactions: 0, turns: 0 };
+const stats = { calls: 0, byTool: new Map(), compactions: 0, turns: 0, modelCalls: 0 };
 let step = 0;
 
 say(`file  ${file}`);
@@ -219,6 +224,45 @@ for (const line of lines) {
       }
       break;
 
+    case "model_call": {
+      // Only present when the run had HX_LOG_PROMPTS=1. This is the one record
+      // that holds what the model was actually sent.
+      stats.modelCalls++;
+      const req = p.request ?? {};
+      const res = p.response ?? {};
+      const n = (req.messages ?? []).length;
+      const stepLabel = p.step ? `step ${p.step.current}/${p.step.max}` : p.kind;
+      if (p.dropped) {
+        say(`\n      ↑ model call (${stepLabel}) -- ${p.dropped}`);
+      } else if (!wantPrompts) {
+        say(
+          `\n      ↑ model call (${stepLabel}): ${n} message(s), ${(req.tools ?? []).length} tool(s)` +
+            ` → in=${res.usage?.inputTokens} out=${res.usage?.outputTokens}  ${p.ms}ms` +
+            `   [--prompts to see it]`,
+        );
+      } else {
+        say(`\n${rule("-")}`);
+        say(`MODEL CALL  ${stepLabel}  (${p.kind})  ${p.model}`);
+        say(`${rule("-")}`);
+        for (const m of req.messages ?? []) {
+          say(`\n  [${m.role}]`);
+          if (m.content) say(indent(cut(m.content, 4000), "    "));
+          for (const tc of m.toolCalls ?? []) {
+            say(indent(`(tool_call ${tc.name}) ${cut(tc.argumentsJson, 1500)}`, "    "));
+          }
+        }
+        say(`\n  [tools offered] ${(req.tools ?? []).map((t) => t?.function?.name ?? t?.name ?? "?").join(" ")}`);
+        say(`\n  [response] in=${res.usage?.inputTokens} out=${res.usage?.outputTokens} ${p.ms}ms`);
+        if (res.reasoning) say(indent(`reasoning: ${cut(res.reasoning, 2000)}`, "    "));
+        if (res.content) say(indent(cut(res.content, 4000), "    "));
+        for (const tc of res.tool_calls ?? []) {
+          say(indent(`(tool_call ${tc.name}) ${cut(tc.argumentsJson, 1500)}`, "    "));
+        }
+        say(`${rule("-")}`);
+      }
+      break;
+    }
+
     case "compacted":
       stats.compactions++;
       say(
@@ -267,10 +311,15 @@ say(`\n${rule()}`);
 const tools = [...stats.byTool.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`);
 say(`${stats.turns} user turn(s), ${stats.calls} tool call(s): ${tools.join("  ")}`);
 if (stats.compactions) say(`${stats.compactions} context compaction(s)`);
+if (stats.modelCalls) say(`${stats.modelCalls} model call(s) recorded${wantPrompts ? "" : " -- add --prompts to see them"}`);
 say(
-  `\nNote: a rollout records the conversation, not the exact prompt. Each step's\n` +
-    `input is assembled fresh by buildPrompt() (system prompt + world snapshot +\n` +
-    `history) and is never written to disk.`,
+  stats.modelCalls
+    ? `\nNote: model_call records hold the assembled messages and tool schemas --\n` +
+        `the semantic input. They are not a byte-level capture of the HTTP body;\n` +
+        `the transport adds the model name and sampling parameters of its own.`
+    : `\nNote: this run did not record prompts, so the above is the conversation,\n` +
+        `not the exact input to the model. Each step's prompt is assembled fresh by\n` +
+        `buildPrompt() and is not written to disk unless HX_LOG_PROMPTS=1.`,
 );
 
 process.stdout.write(out.join("\n") + "\n");

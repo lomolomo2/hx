@@ -303,6 +303,9 @@ async function main(): Promise<number> {
       maxSteps: opts.maxSteps,
       onEvent: render,
       rules: preset(parsePreset(opts.approval)),
+      // Off unless asked for: see the note on AgentOptions.logPrompts. The
+      // rollout grows quadratically with it on.
+      logPrompts: process.env["HX_LOG_PROMPTS"] === "1",
       ...(approvalHandler ? { approval: approvalHandler } : {}),
       compaction: {
         // Must match the server's n_ctx. Set it too high and the server

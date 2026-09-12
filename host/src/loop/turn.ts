@@ -6,7 +6,7 @@
 //   bug, and the same kind of error as "touching paged memory at
 //   DISPATCH_LEVEL". Build the phases out and that class of error disappears
 //   at the point of writing.
-import type { ModelClient, ModelMessage } from "../model/types.js";
+import type { AssistantTurn, ModelClient, ModelMessage } from "../model/types.js";
 import type { SandboxReport, ThreadEvent, Usage } from "../protocol/events.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolContext } from "../tools/types.js";
@@ -39,6 +39,18 @@ export interface AgentOptions {
   depth?: number;
   /** Maximum nesting depth. At the cap the task tool is no longer available. */
   maxDepth?: number;
+  /**
+   * Record the exact input handed to the model, and its raw reply, as
+   * `model_call` records in the rollout.
+   *
+   * ★ Off by default, and that is a size decision rather than a privacy one.
+   *   Step N's prompt contains the whole history up to N, so logging every
+   *   step costs O(n^2) -- a 19-step run whose rollout is 32 KB produces
+   *   several hundred KB of prompts. Nothing new is exposed (the history is
+   *   already in the rollout); it is simply the same bytes over and over.
+   *   Turn it on when you need to know what the model actually saw.
+   */
+  logPrompts?: boolean;
   /** How many subagents may be dispatched in one turn */
   maxSubagents?: number;
 }
@@ -188,9 +200,68 @@ export class Agent {
     }
   }
 
+  /**
+   * Every call to the model goes through here, so that "record what the model
+   * was actually sent" cannot be implemented at one call site and forgotten at
+   * the other -- there are two (a turn, and the compaction summarizer), and
+   * both are input to the model.
+   *
+   * ★ What this records is the semantic input: the assembled messages and the
+   *   tool schemas offered. It is not a byte-level capture of the HTTP body --
+   *   the transport adds model name and sampling parameters of its own. The
+   *   distinction matters when reading the log back, so the record says which
+   *   it is.
+   */
+  async #complete(
+    kind: "turn" | "summarize",
+    messages: ModelMessage[],
+    schemas: Record<string, unknown>[],
+  ): Promise<AssistantTurn> {
+    const startedAt = Date.now();
+    const assistant = await this.model.complete(messages, schemas);
+    if (!this.opts.logPrompts) return assistant;
+
+    const record = {
+      kind,
+      step: this.#world?.step ?? null,
+      model: this.model.name,
+      request: { messages, tools: schemas },
+      response: {
+        content: assistant.content,
+        ...(assistant.reasoning ? { reasoning: assistant.reasoning } : {}),
+        tool_calls: assistant.toolCalls,
+        ...(assistant.finishReason ? { finish_reason: assistant.finishReason } : {}),
+        usage: assistant.usage,
+      },
+      ms: Date.now() - startedAt,
+    };
+
+    // ★ The engine rejects a line over 8 MiB (proto/hxp-v0.md section 0), and
+    //   #log swallows failures so the whole run does not die over a log write.
+    //   Together that would drop an oversized record silently -- the worst
+    //   outcome for a feature whose entire job is fidelity. So measure first
+    //   and, when it will not fit, record the fact instead of the content.
+    const size = JSON.stringify(record).length;
+    const kCap = 6 * 1024 * 1024;
+    this.#log(
+      "model_call",
+      size > kCap
+        ? {
+            kind,
+            step: record.step,
+            model: record.model,
+            dropped: `prompt record was ${size} bytes, over the ${kCap} byte cap; content omitted`,
+            response: record.response,
+            ms: record.ms,
+          }
+        : record,
+    );
+    return assistant;
+  }
+
   /** The two streams stay separate: what the model sees goes to response_item,
    *  what people see goes to event. */
-  #log(type: "response_item" | "event" | "compacted", payload: unknown): void {
+  #log(type: "response_item" | "event" | "compacted" | "model_call", payload: unknown): void {
     void this.engine.logAppend({ type, payload }).catch(() => {
       /* logging must not drag down the main path; engine-side failures are
          already reported on stderr */
@@ -270,7 +341,7 @@ export class Agent {
       this.#phase = "streaming";
       let assistant;
       try {
-        assistant = await this.model.complete(messages, schemas);
+        assistant = await this.#complete("turn", messages, schemas);
       } catch (e) {
         const message = (e as Error).message;
         this.#emit({ type: "turn.failed", error: { message } });
@@ -486,7 +557,8 @@ export class Agent {
       //   With it missing, the model wrote "The original task statement isn't
       //   in the visible history" into its summary, then dropped the goal,
       //   started exploring again, and looped forever.
-      const r = await this.model.complete(
+      const r = await this.#complete(
+        "summarize",
         [
           this.#history[0] ?? { role: "user", content: "(task unavailable)" },
           ...toSummarize,

@@ -158,6 +158,7 @@ curl -X POST localhost:4100/session/s1/prompt -H 'content-type: application/json
 | `HX_ENGINE` | `../engine/build/hxd`（Windows 上是 `hxd.exe`） | 引擎路径 |
 | `HX_SHELL` | Linux `bash`，Windows `cmd` | `bash` 工具用哪个 shell。**改了它，工具描述里给模型看的方言名也跟着改** —— 名字叫 bash、底下跑 cmd 而不告诉模型，它会一路发 POSIX 命令然后每条都失败 |
 | `HX_SHOW_REASONING` | — | 设了就显示推理模型的思考摘要 |
+| `HX_LOG_PROMPTS` | — | 设成 `1` 就把每一步**实际发给模型的输入**也记成 `model_call` 记录。默认关，因为第 N 步的提示词包含前 N 步的全部历史，代价是 O(n²)——实测 7 步的会话 rollout 从 6 KB 涨到 50 KB。用 `node scripts/transcript.mjs --prompts` 读回来 |
 
 CLI 参数：`--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`。
 
@@ -291,6 +292,7 @@ Item 类型：`agent_message` `reasoning` `command_execution` `file_change` `fil
 node scripts/transcript.mjs --list    # 有哪些会话
 node scripts/transcript.mjs s6468     # 某个会话的对话记录
 node scripts/transcript.mjs s6468 --full
+HX_LOG_PROMPTS=1 hx "..."   # 然后 transcript.mjs --prompts
 ```
 
 它把每次工具调用和它的结果配好对，并渲染沙箱实况、审批、子 agent 授权与压缩。

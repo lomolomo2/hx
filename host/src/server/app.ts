@@ -77,6 +77,7 @@ export function createApp(opts: ServerOptions) {
       maxSteps: body.maxSteps ?? 20,
       onEvent: (e) => publish(session, e),
       rules: preset(parsePreset(body.approval)),
+      logPrompts: process.env["HX_LOG_PROMPTS"] === "1",
       enginePath: opts.enginePath,
       // Server-side ask goes through an HTTP callback: suspend and wait for a
       // reply at /approval/:id

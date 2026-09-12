@@ -187,6 +187,7 @@ curl -X POST localhost:4100/session/s1/prompt -H 'content-type: application/json
 | `HX_ENGINE` | `../engine/build/hxd` (`hxd.exe` on Windows) | Engine path |
 | `HX_SHELL` | `bash` on Linux, `cmd` on Windows | Which shell the `bash` tool uses. **Change it and the dialect name shown to the model changes too** -- call it bash, run cmd underneath, and tell the model nothing, and it will send POSIX commands throughout and fail on every one |
 | `HX_SHOW_REASONING` | — | Set it to display a reasoning model's thinking summary |
+| `HX_LOG_PROMPTS` | — | Set to `1` to also record the exact input handed to the model each step as `model_call` records. Off by default because step N's prompt contains the whole history up to N, so it costs O(n²) -- measured, a 7-step run's rollout went from 6 KB to 50 KB. Read them back with `node scripts/transcript.mjs --prompts` |
 
 CLI flags: `--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`.
 
@@ -382,6 +383,7 @@ To read one back:
 node scripts/transcript.mjs --list    # what sessions exist
 node scripts/transcript.mjs s6468     # one session, as a transcript
 node scripts/transcript.mjs s6468 --full
+HX_LOG_PROMPTS=1 hx "..."   # then: transcript.mjs --prompts
 ```
 
 It pairs each tool call with its result and renders the sandbox report,
