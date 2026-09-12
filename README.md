@@ -376,6 +376,20 @@ The first record is `session_meta`, nailing "did this run have a real sandbox"
 into the log (`caps` + `effective` + `warnings`) so that reading the log later
 requires no guessing.
 
+To read one back:
+
+```bash
+node scripts/transcript.mjs --list    # what sessions exist
+node scripts/transcript.mjs s6468     # one session, as a transcript
+node scripts/transcript.mjs s6468 --full
+```
+
+It pairs each tool call with its result and renders the sandbox report,
+approvals, subagent grants and compactions. Note what a rollout does *not*
+hold: the exact text sent to the model. Each step's prompt is assembled fresh
+by `buildPrompt()` and never written to disk; what is recorded is the
+conversation.
+
 Context compaction writes a `compacted` record carrying **the original text it
 replaced** (`replacement_history`), the summary, and token counts before and
 after. **Compaction is an auditable record, not a quiet rewrite of history** --
@@ -482,6 +496,7 @@ host/
   test/all.sh, all.ps1     each platform's full regression suite
 hx.ps1, hx.cmd             the Windows launcher: add to PATH and type `hx` in any repo
 try-hx.ps1                 the Windows try-it entry point (-Caps / -Sandbox / -Repl / an offline task)
+scripts/transcript.mjs     read a rollout back as a readable transcript (node scripts/transcript.mjs --list)
 ```
 
 **The principle for splitting by platform: select whole files, never scatter
