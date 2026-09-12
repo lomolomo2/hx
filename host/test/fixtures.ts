@@ -1,41 +1,49 @@
-// 测试夹具里那些**必须随平台变**的东西。
+// The parts of the test fixtures that **must** vary by platform.
 //
-// ★ 为什么不统一用一种语言：沙箱里跑得起来的解释器，两个平台不一样。
-//   两边挑的都是「装在系统目录、因而在沙箱里天然可见」的那一个 ——
-//   这不是将就，是同一条原则在两个平台上的结果。
+// ★ Why not settle on one language: the interpreters that actually run inside
+//   the sandbox differ between the platforms. Each side picks the one that is
+//   installed in a system directory and therefore naturally visible inside the
+//   sandbox -- this is not a compromise, it is the same principle producing
+//   different answers on two platforms.
 //
-//   Linux  用 python3 —— 它在 /usr/bin，属于默认只读路径。
-//          不能用 node：nvm 装的 node 在 $HOME 下，而 $HOME 默认不可读
-//          （README「已知的坑」第一条），测试会因为环境不同而时好时坏。
+//   Linux   uses python3 -- it lives in /usr/bin, one of the default read-only
+//           paths. node cannot be used: nvm installs node under $HOME, and
+//           $HOME is unreadable by default (the first of the README's "known
+//           traps"), so the tests would pass or fail depending on the machine.
 //
-//   Windows 用 powershell.exe —— 它在 %SystemRoot%\System32 下，
-//          出厂就授权给 ALL APPLICATION PACKAGES。
+//   Windows uses powershell.exe -- it lives under %SystemRoot%\System32 and
+//           ships granted to ALL APPLICATION PACKAGES.
 //
-//   Windows 上被排除掉的那几个，实测结果记在这里，省得下次再试一遍：
-//     · python3 —— 是个 Microsoft Store 占位程序，跑起来只提示去商店安装；
-//       真正的 python.exe 装在 %LOCALAPPDATA%，沙箱读不到
-//     · node    —— 装在 Program Files，但 Node 安装程序**断开了 ACL 继承**，
-//       那个目录没有 ALL APPLICATION PACKAGES 的 ACE，AppContainer 起不来
-//     · git / cscript —— 同样起不来
+//   The candidates ruled out on Windows, with the measured results recorded
+//   here so nobody has to try them again:
+//     - python3 -- a Microsoft Store placeholder; running it only prints a
+//       prompt to install from the Store. The real python.exe installs into
+//       %LOCALAPPDATA%, which the sandbox cannot read
+//     - node    -- installed in Program Files, but the Node installer
+//       **breaks ACL inheritance**, so that directory has no ALL APPLICATION
+//       PACKAGES ACE and an AppContainer cannot start it
+//     - git / cscript -- likewise cannot start
 //
-//   这正是 Windows 版的「$HOME 里的工具链跑不了」，而且更麻烦一点：
-//   连 Program Files 里的东西都可能中招，而补 ACL 需要管理员权限。
-//   判据是目标目录有没有给 ALL APPLICATION PACKAGES 授权，
-//   `icacls <dir>` 一看便知。
+//   This is the Windows version of "the toolchain in $HOME will not run", and
+//   slightly worse: even things in Program Files can be affected, and fixing
+//   the ACL requires administrator rights.
+//   The test is whether the target directory grants ALL APPLICATION PACKAGES,
+//   and `icacls <dir>` shows it at a glance.
 import { isWindows } from "../src/platform.js";
 
 export interface Fixture {
-  /** 被修的源文件 */
+  /** The source file being fixed */
   sourceName: string;
   sourceBroken: string;
-  /** 跑测试的文件 */
+  /** The file that runs the test */
   testName: string;
   testBody: string;
-  /** 跑测试的命令（交给 bash 工具，由 platform.shellCommand 包装） */
+  /** The command that runs the test (handed to the bash tool and wrapped by
+   *  platform.shellCommand) */
   runCommand: string;
-  /** 把 source 从"坏"改成"好"的补丁 */
+  /** The patch that turns source from broken into fixed */
   patch: string;
-  /** 修好之后源文件里应该出现的内容 */
+  /** What the source file should contain once fixed */
   fixedMarker: string;
 }
 
@@ -44,8 +52,10 @@ const python: Fixture = {
   sourceBroken: "def add(a, b):\n    return a - b\n",
   testName: "test_calc.py",
   testBody: 'from calc import add\nassert add(2, 3) == 5\nprint("ALL TESTS PASS")\n',
-  // -B：不写 .pyc。补丁把 "a - b" 改成 "a + b" 字节数不变，若又落在同一秒内，
-  // Python 的 (mtime秒, size) 校验会判定缓存有效 —— 改对了却仍报失败。
+  // -B: write no .pyc. The patch changes "a - b" to "a + b" without changing
+  // the byte count, and if it also lands within the same second, Python's
+  // (mtime seconds, size) check judges the cache still valid -- so the fix is
+  // correct yet the test still reports failure.
   runCommand: "python3 -B test_calc.py",
   patch: `*** Begin Patch
 *** Update File: calc.py
@@ -62,13 +72,15 @@ const powershell: Fixture = {
   sourceName: "calc.ps1",
   sourceBroken: "function Add-Values($a, $b) {\r\n    return $a - $b\r\n}\r\n",
   testName: "test_calc.ps1",
-  // 三处都是实测踩出来的：
-  //   · $ErrorActionPreference = Stop —— 否则 Write-Error 不中断执行，
-  //     脚本带着一屏报错照样 exit 0，于是"测试通过"了但什么都没验到
-  //   · $PSScriptRoot —— 写 ".\calc.ps1" 点源会 CommandNotFound：
-  //     PowerShell 的 provider 当前位置未必等于进程 cwd
-  //   · -ExecutionPolicy Bypass 放在命令行上 —— 默认策略会拒绝执行 .ps1 文件，
-  //     那是本机配置，不该让端到端测试的成败取决于它
+  // All three of these were learned the hard way:
+  //   - $ErrorActionPreference = Stop -- otherwise Write-Error does not halt
+  //     execution, the script exits 0 with a screen full of errors, and the
+  //     "test passes" while verifying nothing
+  //   - $PSScriptRoot -- dot-sourcing ".\calc.ps1" gives CommandNotFound:
+  //     PowerShell's provider location is not necessarily the process cwd
+  //   - -ExecutionPolicy Bypass on the command line -- the default policy
+  //     refuses to run .ps1 files, and that is machine configuration; an
+  //     end-to-end test's outcome must not depend on it
   testBody:
     "$ErrorActionPreference = 'Stop'\r\n" +
     '. "$PSScriptRoot\\calc.ps1"\r\n' +
@@ -76,9 +88,10 @@ const powershell: Fixture = {
     "if ($r -ne 5) { Write-Output \"FAIL: got $r\"; exit 1 }\r\n" +
     "Write-Output 'ALL TESTS PASS'\r\n",
   runCommand: "powershell -NoProfile -ExecutionPolicy Bypass -File test_calc.ps1",
-  // ★ 补丁本身是 LF 的，而夹具文件是 CRLF —— 这是故意的：
-  //   它顺带验了 apply_patch 的行尾处理（见 fs/apply_patch.cpp 的 LineEnding）。
-  //   不处理 CRLF 的话，这个补丁会报 "context not found"。
+  // ★ The patch itself is LF while the fixture file is CRLF -- deliberately:
+  //   it also exercises apply_patch's line-ending handling (see LineEnding in
+  //   fs/apply_patch.cpp). Without CRLF handling, this patch reports "context
+  //   not found".
   patch: `*** Begin Patch
 *** Update File: calc.ps1
 @@
@@ -93,7 +106,8 @@ const powershell: Fixture = {
 
 export const fixture: Fixture = isWindows ? powershell : python;
 
-/** 产出大量输出、用来把上下文顶到压缩阈值的命令。 */
+/** A command that produces a lot of output, used to push the context up to the
+ *  compaction threshold. */
 export function fillerCommand(step: number): string {
   return isWindows
     ? `powershell -NoProfile -Command "Write-Output ('STEP${step} filler line. ' * 300)"`

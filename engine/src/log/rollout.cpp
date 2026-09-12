@@ -39,9 +39,11 @@ bool Rollout::Open(const std::string& base, const std::string& name, std::string
     root = platform::Join(platform::Join(home, ".hx"), "sessions");
   }
 
-  // LocalDatePath 给的是 YYYY/MM/DD 形式，直接 Join 会拼出混着两种分隔符的
-  // 路径（前半截反斜杠、后半截正斜杠）。能用，但日志里看着像 bug，
-  // 而且拿去和 roots 比较时会对不上 —— 统一成本平台的分隔符。
+  // LocalDatePath returns the YYYY/MM/DD form, so a bare Join produces a path
+  // mixing both separators (backslashes in the first half, forward slashes in
+  // the second). It works, but it looks like a bug in the log and will not
+  // match when compared against roots -- so normalize to this platform's
+  // separator.
   const std::string dir = platform::Normalize(platform::Join(root, platform::LocalDatePath()));
   if (!platform::MakeDirs(dir, err)) return false;
 
@@ -59,7 +61,8 @@ int64_t Rollout::Append(const json& record) {
   std::string s = line.dump();
   s.push_back('\n');
 
-  // 一次写追加：进程中途被杀也不会留下半行。见 platform::AppendFile。
+  // One appending write: a process killed partway leaves no half line. See
+  // platform::AppendFile.
   if (!file_.WriteRecord(s)) return -1;
   return seq_;
 }

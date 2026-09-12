@@ -1,4 +1,5 @@
-// hxp v0 的宿主侧类型。规范：proto/hxp-v0.md（引擎与宿主都以它为准）
+// Host-side types for hxp v0. The spec is proto/hxp-v0.md, which both the
+// engine and the host follow.
 
 export type Replay = "never" | "safe";
 

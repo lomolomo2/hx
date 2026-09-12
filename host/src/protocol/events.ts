@@ -1,7 +1,9 @@
-// 给人看的事件流。与"给模型看的历史"是两条独立的流（规矩一）。
+// The event stream for people. Separate from "the history for the model" --
+// two independent streams (rule one).
 //
-// Item 是 UI 的一等公民：先 started、再 updated、最后 completed。
-// 这个粒度照抄 Codex SDK —— 前端几乎不用二次加工。
+// Item is a first-class citizen of the UI: started, then updated, then
+// completed. The granularity is copied from the Codex SDK -- a front end needs
+// almost no further processing.
 
 export type ItemStatus = "in_progress" | "completed" | "failed";
 
@@ -31,7 +33,8 @@ export type Item =
       instructions: string;
       status: ItemStatus;
       result?: string;
-      /** 被驳回的越权诉求 —— 子 agent 被注入的早期信号 */
+      /** Rejected over-reaching requests -- an early signal that a subagent
+       *  has been injected */
       rejected?: string[];
     }
   | { id: string; type: "error"; message: string };
@@ -51,7 +54,7 @@ export type ThreadEvent =
   | { type: "turn.failed"; error: { message: string } }
   | {
       type: "context.compacted";
-      /** 被摘要替换掉的消息条数 */
+      /** How many messages the summary replaced */
       replacedMessages: number;
       tokensBefore: number;
       tokensAfter: number;
@@ -61,19 +64,22 @@ export type ThreadEvent =
   | { type: "policy.violation"; op: string; reason: string }
   | { type: "error"; message: string };
 
-/** 引擎如实回报的隔离实况——不是我们希望的，是内核真正给的。 */
+/** The isolation reality the engine reports honestly -- not what we hoped for,
+ *  but what the kernel actually granted. */
 export interface SandboxReport {
   sandbox: string;
   net: string;
   enforced: boolean;
   netEnforced: boolean;
   /**
-   * 内核这一侧到底是谁在强制："landlock" / "appcontainer" / "none"。
+   * What is doing the enforcing on the kernel side: "landlock" /
+   * "appcontainer" / "none".
    *
-   * ★ 原来这里是 landlockAbi: number。那是把一个平台专有的实现细节
-   *   焊进了协议 —— 宿主要判断的一直是「这次有没有真沙箱」，
-   *   而不是「用的哪套内核接口、第几版」。想看细节的话，
-   *   rollout 第一条 session_meta 里有完整的 caps。
+   * ★ This used to be landlockAbi: number, which welded a platform-specific
+   *   implementation detail into the protocol -- what the host has always
+   *   needed to decide is "was there a real sandbox this time", not "which
+   *   kernel interface, at which version". For the details, the rollout's
+   *   first session_meta record carries the full caps.
    */
   backend: string;
   warnings: string[];

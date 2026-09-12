@@ -14,25 +14,30 @@ namespace hx {
 namespace {
 
 /**
- * 行尾风格。
+ * Line-ending style.
  *
- * ★ 不处理 CRLF 的后果比想象中严重，两条都实测过：
+ * ★ Not handling CRLF has worse consequences than it sounds, both of them
+ *   measured:
  *
- *   ① **上下文永远匹配不上。** 补丁格式按 '\n' 分行，而 Windows 上绝大多数
- *      文件是 CRLF —— 从文件里切出来的每一行都多一个尾随 '\r'，
- *      与补丁里的上下文行逐字节比较必然失败。表现是 apply_patch 对
- *      Windows 上任何一个 CRLF 文件都报 "context not found"，
- *      而补丁本身完全正确。
+ *   1. **Context never matches.** The patch format splits on '\n', while the
+ *      overwhelming majority of files on Windows are CRLF -- every line cut
+ *      out of the file carries a trailing '\r', so a byte-for-byte comparison
+ *      against the patch's context lines is bound to fail. The symptom is
+ *      apply_patch reporting "context not found" for every CRLF file on
+ *      Windows while the patch itself is perfectly correct.
  *
- *   ② **就算匹配上了，回写会改掉整个文件的行尾。** 按 '\n' 重新拼接
- *      等于把 CRLF 文件整体转成 LF，于是「改了一行」产生一个全文件的 diff。
- *      在 Windows 仓库里这足以淹没真正的改动。
+ *   2. **Even when it matches, writing back rewrites the whole file's line
+ *      endings.** Rejoining on '\n' converts a CRLF file wholesale to LF, so
+ *      "changed one line" produces a whole-file diff. In a Windows repository
+ *      that is enough to drown the real change.
  *
- *   所以：拆行时剥掉 '\r' 并记住原风格，拼回去时按原风格还原。
+ *   Hence: strip '\r' when splitting, remember the original style, and restore
+ *   it when joining back.
  */
 enum class LineEnding { kLf, kCrLf };
 
-/** style 非空时回报这个文本原本的行尾风格（以第一个换行为准）。 */
+/** When style is non-null, reports this text's original line-ending style
+ *  (judged by the first newline). */
 std::vector<std::string> SplitLines(const std::string& s, LineEnding* style = nullptr) {
   if (style != nullptr) {
     const size_t nl = s.find('\n');
@@ -52,7 +57,7 @@ std::vector<std::string> SplitLines(const std::string& s, LineEnding* style = nu
       break;
     }
     size_t len = nl - start;
-    if (len > 0 && s[start + len - 1] == '\r') --len;  // 剥掉 CRLF 的 '\r'
+    if (len > 0 && s[start + len - 1] == '\r') --len;  // strip CRLF's '\r'
     out.push_back(s.substr(start, len));
     start = nl + 1;
   }
@@ -70,8 +75,9 @@ std::string JoinLines(const std::vector<std::string>& lines, bool trailing_newli
   return out;
 }
 
-// 文件 I/O 全部走 platform：原子替换（临时文件 -> 落盘 -> rename）的语义
-// 两个平台一致，见 platform::WriteFileAtomic。
+// All file I/O goes through platform: the semantics of atomic replacement
+// (temp file -> flush -> rename) are identical on both platforms; see
+// platform::WriteFileAtomic.
 bool ReadWholeFile(const std::string& path, std::string* out, std::string* err) {
   return platform::ReadWholeFile(path, out, err);
 }
@@ -81,8 +87,8 @@ bool WriteAtomic(const std::string& path, const std::string& content, std::strin
 }
 
 struct Hunk {
-  std::vector<std::string> before;  // 上下文 + 被删除
-  std::vector<std::string> after;   // 上下文 + 被加入
+  std::vector<std::string> before;  // context + removed lines
+  std::vector<std::string> after;   // context + added lines
 };
 
 struct ParsedFile {
@@ -94,7 +100,8 @@ struct ParsedFile {
 
 bool StartsWith(std::string_view s, std::string_view p) { return s.rfind(p, 0) == 0; }
 
-// 在 lines 中从 from 起找到与 before 完全一致的一段，返回起点；找不到返回 npos
+// Find a run in lines, starting at from, that matches before exactly, and
+// return its start; npos when not found
 size_t FindBlock(const std::vector<std::string>& lines, const std::vector<std::string>& before,
                  size_t from) {
   if (before.empty()) return from;
@@ -120,7 +127,7 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
     return r;
   }
 
-  // ---------- 解析 ----------
+  // ---------- parse ----------
   const std::vector<std::string> lines = SplitLines(patch_text);
   std::vector<ParsedFile> files;
   ParsedFile* cur = nullptr;
@@ -172,7 +179,7 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
         cur->hunks.emplace_back();
         hunk = &cur->hunks.back();
       }
-      if (line.empty()) {  // 空行按空上下文处理
+      if (line.empty()) {  // an empty line counts as empty context
         hunk->before.emplace_back();
         hunk->after.emplace_back();
       } else if (line[0] == ' ') {
@@ -189,7 +196,7 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
       }
       continue;
     }
-    // delete：头之后不该有内容
+    // delete: nothing may follow the header
     if (!line.empty()) {
       r.error_code = err::kBadArgs;
       r.error = "Delete File takes no body: " + line;
@@ -203,7 +210,8 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
     return r;
   }
 
-  // ---------- 先全部算完（任何失败都还没落盘） ----------
+  // ---------- compute everything first (nothing is written until it all
+  //            succeeds) ----------
   struct Planned {
     std::string kind;
     std::string abs_path;
@@ -228,12 +236,13 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
     p.rel_path = f.path;
 
     if (f.kind == "add") {
-      // 新建的文件一律用 LF，两个平台一致。
-      // 理由是确定性：补丁本身就是 LF 的，跟着平台走会让同一个补丁在
-      // Linux 和 Windows 上产出不同字节的文件，测试和 diff 都会跟着漂。
+      // Newly created files always use LF, identically on both platforms.
+      // The reason is determinism: the patch itself is LF, and following the
+      // platform would make the same patch produce byte-different files on
+      // Linux and Windows, with tests and diffs drifting along with them.
       p.content = JoinLines(f.add_lines, /*trailing_newline=*/true, LineEnding::kLf);
     } else if (f.kind == "delete") {
-      // 不需要内容
+      // no content needed
     } else {
       std::string original;
       std::string ferr;
@@ -243,7 +252,8 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
         return r;
       }
       const bool had_trailing = !original.empty() && original.back() == '\n';
-      // 记住原文件的行尾风格，回写时照原样还原 —— 见 LineEnding 的注释。
+      // Remember the original file's line-ending style and restore it verbatim
+      // when writing back -- see the comments on LineEnding.
       LineEnding style = LineEnding::kLf;
       std::vector<std::string> cur_lines = SplitLines(original, &style);
 
@@ -267,7 +277,7 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
     planned.push_back(std::move(p));
   }
 
-  // ---------- 落盘 ----------
+  // ---------- write ----------
   for (const auto& p : planned) {
     std::string ferr;
     if (p.kind == "delete") {

@@ -24,19 +24,20 @@
 namespace hx {
 namespace {
 
-// 传 NULL + LANDLOCK_CREATE_RULESET_VERSION 是内核规定的 ABI 探测方式：
-// 不创建 ruleset，只返回版本号。
+// Passing NULL + LANDLOCK_CREATE_RULESET_VERSION is the kernel's prescribed
+// way to probe the ABI: it creates no ruleset and just returns the version.
 int ProbeLandlockAbi() {
   const long rc = ::syscall(__NR_landlock_create_ruleset, nullptr, size_t{0},
                             LANDLOCK_CREATE_RULESET_VERSION);
   if (rc < 0) {
-    return 0;  // ENOSYS（内核没编）/ EOPNOTSUPP（没在 LSM 链里启用）
+    return 0;  // ENOSYS (not compiled into the kernel) / EOPNOTSUPP (not enabled in the LSM chain)
   }
   return static_cast<int>(rc);
 }
 
 bool ProbeSeccomp() {
-  // PR_GET_SECCOMP 在支持 seccomp 的内核上返回当前模式（0 = disabled）。
+  // On a kernel with seccomp support, PR_GET_SECCOMP returns the current mode
+  // (0 = disabled).
   errno = 0;
   const int rc = ::prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
   return rc >= 0;
@@ -82,8 +83,9 @@ Caps DetectCaps() {
   c.seccomp = ProbeSeccomp();
   c.userns = ProbeUserns();
   c.cgroup2 = ProbeCgroup2(&c.cgroup_path);
-  // 文件系统在不等于限额装得上：再走一遍"建子 cgroup + 写限额"，
-  // 被无内部进程规则挡住时如实报 false 并给出原因。
+  // The filesystem being there does not mean limits can be applied: walk
+  // through "create a child cgroup + write the limits" as well, and when the
+  // no-internal-processes rule blocks it, report false honestly with a reason.
   if (c.cgroup2) {
     std::string probe_path;
     c.cgroup2_usable = Cgroup2Usable(&probe_path, &c.cgroup2_reason);

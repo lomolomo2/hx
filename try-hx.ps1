@@ -1,18 +1,21 @@
-# hx 的 Windows 试跑入口 —— 一条命令看到它到底在干什么。
+# The Windows try-it entry point for hx -- one command to see what it actually
+# does.
 #
-#   pwsh try-hx.ps1                 # 离线：假模型驱动一个完整的多步任务
-#   pwsh try-hx.ps1 -Sandbox        # 只看沙箱：哪些放行、哪些被内核挡掉
-#   pwsh try-hx.ps1 -Caps           # 本机隔离能力自检
-#   pwsh try-hx.ps1 -Repl           # 手工往引擎里灌 hxp/0 请求，看原始回复
+#   pwsh try-hx.ps1                 # offline: a fake model drives a full multi-step task
+#   pwsh try-hx.ps1 -Sandbox        # the sandbox only: what gets through, what the kernel blocks
+#   pwsh try-hx.ps1 -Caps           # this machine's isolation capability self-test
+#   pwsh try-hx.ps1 -Repl           # feed hxp/0 requests to the engine by hand and see the raw replies
 #
-#   # 换成真模型（任何 OpenAI 兼容端点）：
+#   # Switch to a real model (any OpenAI-compatible endpoint):
 #   pwsh try-hx.ps1 -BaseUrl https://192.168.1.241/llm/v1 -Model qwen3.8-27b-uncensored `
-#        -ContextWindow 32768 -Root C:\path\to\repo -Prompt "把 tests 里失败的用例修好"
+#        -ContextWindow 32768 -Root C:\path\to\repo -Prompt "fix the failing tests"
 #
-#   端点是自签证书的话，把 PEM 放到 ~\.hx\certs\llm-<主机名>.pem，
-#   脚本会自己找到并**只**信任它（不是关掉全局 TLS 校验）。
+#   If the endpoint uses a self-signed certificate, put the PEM at
+#   ~\.hx\certs\llm-<hostname>.pem and the script finds it and trusts **only**
+#   it (rather than switching off TLS verification globally).
 #
-# 这是个方便试用的脚本，不参与构建也不参与回归测试，删掉不影响任何东西。
+# This is a convenience script for trying things out. It takes no part in the
+# build or the regression tests, and deleting it affects nothing.
 param(
   [switch]$Sandbox,
   [switch]$Caps,
@@ -25,7 +28,8 @@ param(
   [string]$Approval = "auto",
   [int]$MaxSteps = 20,
   [int]$ContextWindow = 0,
-  # 自签证书的 PEM。不给的话会自己去 ~\.hx\certs\llm-<host>.pem 找。
+  # The PEM for a self-signed certificate. Without it, ~\.hx\certs\llm-<host>.pem
+  # is looked up automatically.
   [string]$CaCert = ""
 )
 
@@ -35,7 +39,7 @@ $hxd = Join-Path $repo "engine\build\hxd.exe"
 
 function Need-Engine {
   if (-not (Test-Path $hxd)) {
-    Write-Host "hxd.exe 不在，先构建..." -ForegroundColor Yellow
+    Write-Host "hxd.exe is missing; building first..." -ForegroundColor Yellow
     pwsh -NoProfile -File (Join-Path $repo "engine\build-win.ps1")
   }
 }
@@ -50,21 +54,21 @@ function Title($t) {
 # ---------------------------------------------------------------- caps
 if ($Caps) {
   Need-Engine
-  Title "本机隔离能力（--self-test）"
+  Title "this machine's isolation capabilities (--self-test)"
   $json = & $hxd --self-test
   $code = $LASTEXITCODE
   $json | ConvertFrom-Json | ConvertTo-Json -Depth 6
   Write-Host ""
-  if ($code -eq 0) { Write-Host "退出码 0 = 这台机器上有真沙箱" -ForegroundColor Green }
-  else { Write-Host "退出码 $code = 没有真沙箱（引擎会如实上报，不会假装安全）" -ForegroundColor Red }
+  if ($code -eq 0) { Write-Host "exit code 0 = this machine has a real sandbox" -ForegroundColor Green }
+  else { Write-Host "exit code $code = no real sandbox (the engine reports honestly and never pretends to be safe)" -ForegroundColor Red }
   exit $code
 }
 
 # ---------------------------------------------------------------- repl
 if ($Repl) {
   Need-Engine
-  Title "hxp/0 直连（每行一个 JSON 请求，Ctrl+C 退出）"
-  Write-Host "示例："
+  Title "hxp/0 direct (one JSON request per line, Ctrl+C to exit)"
+  Write-Host "examples:"
   Write-Host '  {"id":"1","op":"ping"}' -ForegroundColor DarkGray
   Write-Host '  {"id":"2","op":"session.open","args":{"roots":["C:\\some\\dir"],"sandbox":"workspace-write","net":"deny"}}' -ForegroundColor DarkGray
   Write-Host '  {"id":"3","op":"exec.start","args":{"cmd":["cmd","/c","echo hi"],"timeout_ms":5000}}' -ForegroundColor DarkGray
@@ -77,13 +81,13 @@ if ($Repl) {
 # ---------------------------------------------------------------- sandbox
 if ($Sandbox) {
   Need-Engine
-  Title "沙箱实况：该放的放得通 / 该拒的拒掉"
-  Write-Host "（用 engine\tests\windows\smoke.ps1，24 项）" -ForegroundColor DarkGray
+  Title "the sandbox in practice: what should pass gets through / what should be refused is refused"
+  Write-Host "(via engine\tests\windows\smoke.ps1, 24 checks)" -ForegroundColor DarkGray
   pwsh -NoProfile -File (Join-Path $repo "engine\tests\windows\smoke.ps1") -Engine $hxd
   exit $LASTEXITCODE
 }
 
-# ---------------------------------------------------------------- 跑一个任务
+# ---------------------------------------------------------------- run a task
 Need-Engine
 
 $useMock = [string]::IsNullOrWhiteSpace($BaseUrl)
@@ -91,7 +95,8 @@ $ws = $Root
 
 if ($useMock) {
   if (-not $ws) {
-    # 没指定工作区就造一个：一个算错的函数 + 一个会失败的测试
+    # With no workspace given, build one: a function that computes the wrong
+    # answer plus a test that fails
     $ws = Join-Path $env:TEMP "hx-playground"
     Remove-Item -Recurse -Force $ws -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $ws | Out-Null
@@ -111,24 +116,24 @@ if ($useMock) {
   if (-not $Prompt) { $Prompt = "Add-Values is broken. Run the test, find the bug, fix it, and verify." }
 } else {
   if (-not $ws) { $ws = (Get-Location).Path }
-  if (-not $Prompt) { throw "用真模型时必须给 -Prompt" }
-  if (-not $Model) { throw "用真模型时必须给 -Model" }
+  if (-not $Prompt) { throw "-Prompt is required with a real model" }
+  if (-not $Model) { throw "-Model is required with a real model" }
 }
 
-Title "工作区：$ws"
+Title "workspace: $ws"
 Get-ChildItem $ws -File | ForEach-Object { Write-Host ("  " + $_.Name) }
 $target = Join-Path $ws "calc.ps1"
 if (Test-Path $target) {
   Write-Host ""
-  Write-Host "  calc.ps1 现在长这样：" -ForegroundColor DarkGray
+  Write-Host "  calc.ps1 currently looks like this:" -ForegroundColor DarkGray
   Get-Content $target | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkGray }
 }
 
 $mock = $null
 try {
   if ($useMock) {
-    Title "起一个离线的 OpenAI 兼容端点（host\test\mock-model.mjs）"
-    Write-Host "  它只替换'下一步做什么'这个决策；提示词、策略、审批、引擎调用全走真实路径。" -ForegroundColor DarkGray
+    Title "starting an offline OpenAI-compatible endpoint (host\test\mock-model.mjs)"
+    Write-Host "  It replaces only the decision of what to do next; prompts, policy, approval and engine calls all take the real path." -ForegroundColor DarkGray
     $mock = Start-Process node -ArgumentList (Join-Path $repo "host\test\mock-model.mjs") `
             -PassThru -NoNewWindow `
             -RedirectStandardError (Join-Path $env:TEMP "hx-mock.err") `
@@ -141,10 +146,13 @@ try {
     $env:HX_MODEL = $Model
     if ($ApiKey) { $env:HX_API_KEY = $ApiKey }
 
-    # ★ 自签证书：Node 的 fetch 会以 DEPTH_ZERO_SELF_SIGNED_CERT 直接拒掉。
-    #   正确做法是 NODE_EXTRA_CA_CERTS —— **只**信任这一张证书，
-    #   而不是 NODE_TLS_REJECT_UNAUTHORIZED=0 把整个进程的 TLS 校验关掉。
-    #   后者会顺带让这个进程对任何中间人都不设防，代价远超"连上这一台机器"。
+    # ★ Self-signed certificates: Node's fetch refuses them outright with
+    #   DEPTH_ZERO_SELF_SIGNED_CERT.
+    #   The right approach is NODE_EXTRA_CA_CERTS -- trust **only** this one
+    #   certificate, rather than NODE_TLS_REJECT_UNAUTHORIZED=0, which switches
+    #   off TLS verification for the whole process. The latter also leaves this
+    #   process defenceless against any man in the middle, a price far beyond
+    #   "connect to this one machine".
     $pem = $CaCert
     if (-not $pem) {
       $host_ = ([Uri]$BaseUrl).Host
@@ -154,15 +162,16 @@ try {
     if ($pem) {
       if (-not (Test-Path $pem)) { throw "CA cert not found: $pem" }
       $env:NODE_EXTRA_CA_CERTS = (Resolve-Path $pem).Path
-      Write-Host "  TLS: 只信任 $($env:NODE_EXTRA_CA_CERTS)" -ForegroundColor DarkGray
+      Write-Host "  TLS: trusting only $($env:NODE_EXTRA_CA_CERTS)" -ForegroundColor DarkGray
     }
   }
   $env:HX_APPROVAL = $Approval
-  # ★ 必须与服务端 n_ctx 对齐：设大了会被服务端静默截断，设小了会过早压缩。
-  #   llama.cpp 可以从 /props 读到真实值。
+  # ★ Must match the server's n_ctx: too high and the server truncates
+  #   silently, too low and compaction kicks in early.
+  #   llama.cpp exposes the real value at /props.
   if ($ContextWindow -gt 0) { $env:HX_CONTEXT_WINDOW = "$ContextWindow" }
 
-  Title "跑任务：$Prompt"
+  Title "running the task: $Prompt"
   Push-Location (Join-Path $repo "host")
   npx tsx src/cli.ts --root $ws --sandbox workspace-write --net deny --max-steps $MaxSteps $Prompt
   $rc = $LASTEXITCODE
@@ -172,22 +181,22 @@ try {
 }
 
 if (Test-Path $target) {
-  Title "任务之后的 calc.ps1"
+  Title "calc.ps1 after the task"
   Get-Content $target | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Green }
 
-  Title "独立复核：在沙箱外自己再跑一次测试"
+  Title "independent check: run the test again yourself, outside the sandbox"
   Push-Location $ws
   powershell -NoProfile -ExecutionPolicy Bypass -File test_calc.ps1
   Write-Host "  verify exit=$LASTEXITCODE"
   Pop-Location
 }
 
-Title "会话日志（事实来源，append-only）"
+Title "the session log (the source of truth, append-only)"
 $roll = Get-ChildItem (Join-Path $env:USERPROFILE ".hx\sessions") -Recurse -Filter "rollout-*.jsonl" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime | Select-Object -Last 1
 if ($roll) {
   Write-Host "  $($roll.FullName)"
-  Write-Host "  第一条记录钉死了'这次到底有没有真沙箱'：" -ForegroundColor DarkGray
+  Write-Host "  The first record nails down whether this run had a real sandbox:" -ForegroundColor DarkGray
   $meta = (Get-Content $roll.FullName -TotalCount 1 | ConvertFrom-Json)
   Write-Host ("    sandbox  = " + $meta.payload.effective.sandbox + " / " + $meta.payload.effective.net)
   Write-Host ("    enforced = " + $meta.payload.effective.enforced + "   backend = " + $meta.payload.effective.backend)

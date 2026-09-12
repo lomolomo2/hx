@@ -1,7 +1,9 @@
-// token 预算。
+// The token budget.
 //
-// 没有 tokenizer 也能做得准：先用字符数粗估，再用每次调用返回的真实 usage
-// 反过来校准比值。中英文混合、代码、JSON 的比值差很多，写死一个常数必然失真。
+// This can be accurate without a tokenizer: estimate roughly from character
+// counts, then calibrate the ratio backwards from the real usage each call
+// returns. The ratio differs a great deal between mixed-script prose, code and
+// JSON, so a hardcoded constant is bound to be wrong.
 import type { ModelMessage } from "../model/types.js";
 
 const INITIAL_CHARS_PER_TOKEN = 3.5;
@@ -10,11 +12,12 @@ export class TokenEstimator {
   #ratio = INITIAL_CHARS_PER_TOKEN;
   #samples = 0;
 
-  /** 用一次真实调用的结果校准：我们发了多少字符，服务端算了多少 token。 */
+  /** Calibrate from one real call: how many characters we sent, how many
+   *  tokens the server counted. */
   calibrate(charsSent: number, actualTokens: number): void {
     if (actualTokens <= 0 || charsSent <= 0) return;
     const observed = charsSent / actualTokens;
-    // 滑动平均，避免单次异常把比值带偏
+    // A running average, so one outlier does not drag the ratio off
     this.#samples++;
     const weight = Math.min(0.5, 1 / this.#samples);
     this.#ratio = this.#ratio * (1 - weight) + observed * weight;
@@ -29,7 +32,7 @@ export class TokenEstimator {
     for (const m of messages) {
       n += (m.content ?? "").length;
       for (const t of m.toolCalls ?? []) n += t.name.length + t.argumentsJson.length;
-      n += 16; // 每条消息的结构性开销
+      n += 16; // structural overhead per message
     }
     return n;
   }
@@ -41,11 +44,11 @@ export class TokenEstimator {
 
 export interface CompactionSettings {
   enabled: boolean;
-  /** 模型的上下文窗口总量 */
+  /** The model's total context window */
   contextWindow: number;
-  /** 给回复留出的余量 */
+  /** Headroom reserved for the reply */
   reserveTokens: number;
-  /** 末尾这么多 token 的历史保持原文 */
+  /** This many tokens of trailing history are kept verbatim */
   keepRecentTokens: number;
 }
 

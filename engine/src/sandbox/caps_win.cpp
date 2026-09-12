@@ -13,8 +13,8 @@ namespace hx {
 namespace {
 
 std::string ProbeVersion() {
-  // GetVersionEx 对没写 manifest 的程序会撒谎（永远报 6.2）。
-  // RtlGetVersion 是内核那一份，不受 manifest 影响。
+  // GetVersionEx lies to programs without a manifest (it always reports 6.2).
+  // RtlGetVersion is the kernel's own and is unaffected by manifests.
   using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
   HMODULE nt = ::GetModuleHandleW(L"ntdll.dll");
   if (nt != nullptr) {
@@ -35,15 +35,18 @@ std::string ProbeVersion() {
 }
 
 /**
- * AppContainer 探测。
+ * AppContainer probe.
  *
- * ★ 照 cgroup 探测的做法：真的走一遍「建 -> 拿到 SID -> 删」，而不是
- *   只看函数在不在。README 的教训很直白 —— 文件系统在不等于限额装得上。
- *   同理：userenv.dll 导出了 CreateAppContainerProfile，不等于这台机器
- *   （策略限制、容器里跑、被 GPO 关掉）真能建出 profile 来。
+ * ★ Follows the cgroup probe's approach: actually walk through "create -> get
+ *   the SID -> delete" rather than just checking whether a function exists.
+ *   The README's lesson is blunt -- the filesystem being there does not mean
+ *   the limits can be applied. Likewise: userenv.dll exporting
+ *   CreateAppContainerProfile does not mean this machine (policy-restricted,
+ *   running in a container, disabled by GPO) can really create a profile.
  *
- * 探测无副作用：用 hx-probe-<pid> 这个专属名字，成功后立刻删掉，
- * 绝不碰用户已有的 profile。
+ * The probe has no side effects: it uses the dedicated name hx-probe-<pid>,
+ * deletes it immediately on success, and never touches the user's existing
+ * profiles.
  */
 bool ProbeAppContainer(std::string* reason) {
   wchar_t name[64];
@@ -52,7 +55,8 @@ bool ProbeAppContainer(std::string* reason) {
   PSID sid = nullptr;
   HRESULT hr = ::CreateAppContainerProfile(name, name, L"hx capability probe", nullptr, 0, &sid);
   if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
-    // 上一次探测没清干净（比如被 kill -9）。删掉重来，不把它当失败。
+    // A previous probe did not clean up (killed with -9, say). Delete and
+    // retry rather than counting it as a failure.
     ::DeleteAppContainerProfile(name);
     hr = ::CreateAppContainerProfile(name, name, L"hx capability probe", nullptr, 0, &sid);
   }
@@ -66,12 +70,13 @@ bool ProbeAppContainer(std::string* reason) {
 }
 
 /**
- * Job 对象探测。
+ * Job object probe.
  *
- * ★ 同样是「写进去再读回来」。README 里模型自己发现的那条经验
- *   （写完 pids.max 要读回校验 ——「文件存在不等于控制器已下发」）
- *   在这里一字不改地适用：SetInformationJobObject 返回成功，
- *   不等于限额真的挂上了。
+ * ★ Also "write it, then read it back". The lesson the model itself found in
+ *   the README (verify pids.max by reading it back after writing -- "the file
+ *   existing does not mean the controller was delegated") applies here word
+ *   for word: SetInformationJobObject returning success does not mean the
+ *   limit is actually attached.
  */
 bool ProbeJobObjects(bool* nested) {
   HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
@@ -80,7 +85,7 @@ bool ProbeJobObjects(bool* nested) {
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION set{};
   set.BasicLimitInformation.LimitFlags =
       JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  set.BasicLimitInformation.ActiveProcessLimit = 7;  // 随便一个可辨认的值
+  set.BasicLimitInformation.ActiveProcessLimit = 7;  // an arbitrary recognizable value
   bool ok = ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &set,
                                       sizeof(set)) != 0;
   if (ok) {
@@ -92,13 +97,15 @@ bool ProbeJobObjects(bool* nested) {
   }
   ::CloseHandle(job);
 
-  // 嵌套 Job 是 Win8 起的能力，也是「子进程自己建 Job 也逃不出去」的前提。
-  // 没有它，一个知道自己在 Job 里的进程可以靠 CREATE_BREAKAWAY_FROM_JOB 跑掉。
+  // Nested Jobs arrived in Win8 and are the prerequisite for "a child creating
+  // its own Job still cannot escape". Without them, a process that knows it is
+  // in a Job can get out via CREATE_BREAKAWAY_FROM_JOB.
   *nested = false;
   if (ok) {
     BOOL in_job = FALSE;
     if (::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) != 0) {
-      // 能问出来就说明 API 在；嵌套支持从 6.2 起，探测版本号即可
+      // Getting an answer means the API is there; nesting support arrived in
+      // 6.2, so probing the version number is enough
       using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
       HMODULE nt = ::GetModuleHandleW(L"ntdll.dll");
       auto fn = nt == nullptr ? nullptr
@@ -114,7 +121,8 @@ bool ProbeJobObjects(bool* nested) {
   return ok;
 }
 
-/** ConPTY 是 Windows 10 1809（17763）起才有的，这是 forkpty 的唯一对位。 */
+/** ConPTY exists only from Windows 10 1809 (17763) on, and it is forkpty's
+ *  only counterpart. */
 bool ProbeConPty() {
   HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
   if (k32 == nullptr) return false;
@@ -124,9 +132,10 @@ bool ProbeConPty() {
 }  // namespace
 
 bool HasRealSandbox(const Caps& c) {
-  // ★ 与 Linux 侧「没有 Landlock 就没有真沙箱」是同一句话：
-  //   AppContainer 是这台机器上唯一的文件系统隔离来源。
-  //   Job 对象管的是资源与进程树，挡不住 `type %USERPROFILE%\.ssh\id_rsa`。
+  // ★ The same statement as "no Landlock means no real sandbox" on the Linux
+  //   side: AppContainer is this machine's only source of filesystem
+  //   isolation. Job objects govern resources and the process tree, and stop
+  //   nothing about `type %USERPROFILE%\.ssh\id_rsa`.
   return c.appcontainer;
 }
 
@@ -144,28 +153,32 @@ json CapsToJson(const Caps& c) {
       {"proto", "hxp/0"},
       {"platform", "windows"},
       {"kernel", c.kernel},
-      // ★ 键名故意沿用 Linux 侧的语义分组，而不是照搬 Win32 的叫法：
-      //   宿主问的一直是「文件系统隔离有没有」「网络限制有没有」，
-      //   不是「landlock 还是 appcontainer」。换了实现，宿主不用改。
+      // ★ The key names deliberately follow the Linux side's semantic
+      //   grouping rather than copying Win32 terminology: the host has always
+      //   asked "is there filesystem isolation" and "is there a network
+      //   restriction", not "landlock or appcontainer". Change the
+      //   implementation and the host needs no change.
       {"filesystem", json{{"available", c.appcontainer},
                           {"backend", "appcontainer"},
                           {"reason", c.appcontainer_reason}}},
       {"network", json{{"available", c.appcontainer},
                        {"backend", "appcontainer-capabilities"},
-                       // 没有 internetClient 能力时 WFP 连 UDP 一起挡，
-                       // 所以不像 Landlock 那样存在 UDP 盲区。
+                       // Without the internetClient capability WFP blocks UDP
+                       // as well, so there is no UDP blind spot the way
+                       // Landlock has one.
                        {"covers_udp", true}}},
       {"limits", json{{"available", c.job_objects},
                       {"backend", "job-object"},
                       {"nested_jobs", c.nested_jobs},
                       {"max_processes", c.job_objects},
                       {"max_memory", c.job_objects},
-                      // 诚实的缺口：Job 对象没有这两项的对位
+                      // The honest gaps: Job objects have no counterpart for these two
                       {"max_file_bytes", false},
                       {"max_open_files", false}}},
       {"pty", json{{"available", c.conpty}, {"backend", "conpty"}}},
-      // Linux 专有的几项在这里明确报不适用，而不是省略 ——
-      // 省略会让读日志的人以为「没探测」，而不是「不存在」。
+      // The Linux-only entries are reported explicitly as not applicable
+      // rather than omitted -- omitting them would make someone reading the
+      // log think "it was not probed" instead of "it does not exist".
       {"landlock", json{{"available", false}, {"reason", "linux-only"}}},
       {"seccomp", json{{"available", false}, {"reason", "linux-only"}}},
       {"cgroup2", json{{"available", false}, {"reason", "linux-only"}}},

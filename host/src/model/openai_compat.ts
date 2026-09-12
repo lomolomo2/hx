@@ -1,5 +1,5 @@
-// 任何 OpenAI 兼容端点：DeepSeek / 本机 llama.cpp / OpenRouter / vLLM …
-// 换后端只是换 baseUrl，不改任何其它代码。
+// Any OpenAI-compatible endpoint: DeepSeek / a local llama.cpp / OpenRouter /
+// vLLM ... Switching backends means changing baseUrl and nothing else.
 import type { AssistantTurn, ModelClient, ModelMessage } from "./types.js";
 
 interface WireToolCall {
@@ -14,7 +14,8 @@ export class OpenAICompatClient implements ModelClient {
     private readonly baseUrl: string,
     private readonly apiKey: string,
     private readonly model: string,
-    /** 推理模型会先花掉一大截 token 思考，给少了 content 会是空的。 */
+    /** A reasoning model spends a large slice of its tokens thinking first;
+     *  set this too low and content comes back empty. */
     private readonly maxTokens = 4096,
     private readonly temperature?: number,
   ) {
@@ -66,7 +67,8 @@ export class OpenAICompatClient implements ModelClient {
       content: msg.content ?? null,
       ...(reasoning ? { reasoning } : {}),
       toolCalls: (msg.tool_calls ?? []).map((t) => ({
-        // 有些服务端不回 id（llama.cpp 会回），兜一个稳定值免得关联不上
+        // Some servers return no id (llama.cpp does), so synthesize a stable
+        // one to keep the correlation from breaking
         id: t.id || `call_${t.function.name}_${Math.random().toString(36).slice(2, 10)}`,
         name: t.function.name,
         argumentsJson: t.function.arguments,

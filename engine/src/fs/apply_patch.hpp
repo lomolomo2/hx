@@ -1,17 +1,18 @@
-// apply_patch —— 补丁式编辑，而不是整文件覆写。
+// apply_patch -- patch-based editing rather than whole-file overwrites.
 //
-// 为什么不做 fs.write：补丁省 token、可 diff、可审批、可回滚，
-// 而且模型写整文件时极易悄悄丢掉它"没注意到"的部分。
+// Why there is no fs.write: patches cost fewer tokens, can be diffed,
+// approved and rolled back, and a model writing a whole file very easily drops
+// the parts it "did not notice" without saying so.
 //
-// 格式（codex 风格的子集）：
+// The format (a subset of codex's):
 //   *** Begin Patch
 //   *** Add File: a/b.txt
-//   +新文件的每一行都以 + 开头
+//   +every line of a new file starts with +
 //   *** Update File: src/x.cpp
-//   @@ 可选的定位提示
-//    上下文行以空格开头
-//   -被删除的行
-//   +被加入的行
+//   @@ an optional locating hint
+//    context lines start with a space
+//   -a removed line
+//   +an added line
 //   *** Delete File: old.txt
 //   *** End Patch
 #pragma once
@@ -22,18 +23,19 @@
 namespace hx {
 
 struct PatchChange {
-  std::string path;  // 相对 base 的原始写法，用于回报
+  std::string path;  // the original spelling relative to base, for reporting
   std::string kind;  // "add" | "update" | "delete"
 };
 
 struct ApplyPatchResult {
   bool ok = false;
-  std::string error_code;  // 失败时对应 proto 的错误码
+  std::string error_code;  // on failure, the matching proto error code
   std::string error;
   std::vector<PatchChange> changes;
 };
 
-// 全部算完再落盘：任何一步失败都不写任何文件。
+// Everything is computed before anything is written: if any step fails, no
+// file is written at all.
 ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& base,
                             const std::vector<std::string>& roots, bool allow_write);
 

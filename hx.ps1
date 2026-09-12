@@ -1,10 +1,11 @@
-# hx —— 像 claude 一样用：在任意仓库目录里敲 `hx` 就进交互模式。
+# hx -- use it the way you use claude: type `hx` in any repo directory and you
+# are in interactive mode.
 #
-#   hx                          # 交互（当前目录作为工作区）
-#   hx "把 tests 里失败的用例修好"   # 一次性跑完就退
+#   hx                              # interactive (the current directory is the workspace)
+#   hx "fix the failing tests"      # one-shot: run to completion and exit
 #   hx -Net allow -Approval auto
 #
-# 端点配置的优先级：命令行 > 环境变量 > ~\.hx\config.json
+# Endpoint configuration precedence: command line > environment > ~\.hx\config.json
 #
 #   ~\.hx\config.json
 #   {
@@ -14,12 +15,14 @@
 #     "apiKey": ""
 #   }
 #
-# 自签证书：PEM 放到 ~\.hx\certs\llm-<主机名>.pem，本脚本会**只**信任它
-# （NODE_EXTRA_CA_CERTS），而不是把整个进程的 TLS 校验关掉。
+# Self-signed certificates: put the PEM at ~\.hx\certs\llm-<hostname>.pem and
+# this script trusts **only** it (NODE_EXTRA_CA_CERTS), rather than switching
+# off TLS verification for the whole process.
 param(
-  # ★ Position=0 不能省。只写 ValueFromRemainingArguments 的话，
-  #   `hx "任务"` 里那个裸参数会去绑**下一个**可按位置绑定的参数（实测绑到了
-  #   -Approval），于是任务凭空消失、直接报 usage。
+  # ★ Position=0 cannot be omitted. With only ValueFromRemainingArguments, the
+  #   bare argument in `hx "task"` binds to the **next** positionally bindable
+  #   parameter (measured: it bound to -Approval), so the task vanishes and
+  #   usage is printed instead.
   [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Task,
   [string]$Root = "",
   [string]$BaseUrl = "",
@@ -38,8 +41,9 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 
-# 两种布局：解包后的发布版（hxd.exe 和打好的 bundle 就在旁边），
-# 和仓库工作树（引擎要构建，宿主走 tsx 跑 TypeScript 源码）。
+# Two layouts: an unpacked release (hxd.exe and the prebuilt bundle sit right
+# here), and the repository working tree (the engine has to be built and the
+# host runs TypeScript sources through tsx).
 $packagedEngine = Join-Path $repo "hxd.exe"
 $packagedHost = Join-Path $repo "host\hx-host.mjs"
 $packaged = (Test-Path $packagedEngine) -and (Test-Path $packagedHost)
@@ -47,63 +51,71 @@ $packaged = (Test-Path $packagedEngine) -and (Test-Path $packagedHost)
 if ($packaged) {
   $hxd = $packagedEngine
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    throw "hx 需要 Node.js 20+（引擎是原生的，宿主是 JS）。https://nodejs.org"
+    throw "hx needs Node.js 20+ (the engine is native, the host is JS). https://nodejs.org"
   }
   $runner = "node"
   $entry = $packagedHost
 } else {
   $hxd = Join-Path $repo "engine\build\hxd.exe"
   if (-not (Test-Path $hxd)) {
-    Write-Host "hxd.exe 不在，先构建..." -ForegroundColor Yellow
+    Write-Host "hxd.exe is missing; building first..." -ForegroundColor Yellow
     pwsh -NoProfile -File (Join-Path $repo "engine\build-win.ps1")
   }
-  # ★ 不能用 `npx tsx`：npx 从**当前目录**往上找 node_modules，而 hx 就是要在
-  #   别人的仓库里跑。直接指向 host 自己的 tsx，才和 cwd 无关。
+  # ★ `npx tsx` cannot be used: npx searches upward from the **current
+  #   directory** for node_modules, and hx exists precisely to run inside
+  #   someone else's repo. Pointing straight at host's own tsx is what makes
+  #   this independent of cwd.
   $runner = Join-Path $repo "host\node_modules\.bin\tsx.cmd"
-  if (-not (Test-Path $runner)) { throw "tsx 不在：先在 $repo\host 里跑一次 npm install" }
+  if (-not (Test-Path $runner)) { throw "tsx is missing: run npm install once in $repo\host" }
   $entry = Join-Path $repo "host\src\cli.ts"
 }
 
-# ★ 必须显式告诉宿主引擎在哪。宿主默认按自己的位置往上找
-#   ../../engine/build/hxd.exe —— 那是仓库布局，发布包里根本不成立。
+# ★ The host must be told explicitly where the engine is. By default it looks
+#   upward from its own location for ../../engine/build/hxd.exe -- that is the
+#   repository layout and simply does not hold inside a release package.
 $env:HX_ENGINE = $hxd
 
-# ---------------------------------------------------------------- 自检
-# 放在读配置**之前**：验证装没装好这件事不该要求你先配好一个模型端点。
+# ---------------------------------------------------------------- self-test
+# Placed **before** the configuration is read: checking whether the install
+# works should not require having configured a model endpoint first.
 if ($Caps) {
   $json = & $hxd --self-test
   $code = $LASTEXITCODE
   $json | ConvertFrom-Json | ConvertTo-Json -Depth 6
   Write-Host ""
-  if ($code -eq 0) { Write-Host "退出码 0 = 这台机器上有真沙箱" -ForegroundColor Green }
-  else { Write-Host "退出码 $code = 没有真沙箱（引擎如实上报，不会假装安全）" -ForegroundColor Red }
+  if ($code -eq 0) { Write-Host "exit code 0 = this machine has a real sandbox" -ForegroundColor Green }
+  else { Write-Host "exit code $code = no real sandbox (the engine reports honestly and never pretends to be safe)" -ForegroundColor Red }
   exit $code
 }
 
-# ★ 认不出来的 -Flag 必须当场报错，不能当成任务扔给模型。
+# ★ An unrecognised -Flag must be an error on the spot, never handed to the
+#   model as a task.
 #
-#   $Task 带 ValueFromRemainingArguments，什么都接得住 —— 包括打错的开关。
-#   实测 `hx -Caps`（当时还没有这个开关）被整条当成了**任务提示词**：
-#   模型于是认真地去研究"怎么执行 -Caps"，跑满步数、烧掉三十多万 token，
-#   还给出了一段煞有介事但完全错误的根因分析。
-#   一个拼错的开关不该变成一次真实的模型运行。
+#   $Task carries ValueFromRemainingArguments and catches anything at all --
+#   including mistyped switches. Measured: `hx -Caps` (before that switch
+#   existed) was taken in its entirety as the **task prompt**, so the model
+#   earnestly set about researching "how to execute -Caps", spent its whole
+#   step budget, burned 338k tokens, and produced a confident but entirely
+#   wrong root-cause analysis.
+#   A typo in a switch should not become a real model run.
 if ($Task -and $Task[0].StartsWith("-")) {
-  Write-Host "不认识的开关：$($Task[0])" -ForegroundColor Red
+  Write-Host "unrecognised switch: $($Task[0])" -ForegroundColor Red
   Write-Host ""
-  Write-Host "可用开关：-Caps -Root -Net -Sandbox -Approval -MaxSteps -ReadPath"
-  Write-Host "          -BaseUrl -Model -ApiKey -ContextWindow -CaCert"
+  Write-Host "available switches: -Caps -Root -Net -Sandbox -Approval -MaxSteps -ReadPath"
+  Write-Host "                    -BaseUrl -Model -ApiKey -ContextWindow -CaCert"
   Write-Host ""
-  Write-Host "任务本身要带引号：hx `"把 tests 里失败的用例修好`""
+  Write-Host "the task itself needs quotes: hx `"fix the failing tests`""
   exit 64
 }
 
-# ------------------------------------------------------------------ 配置
+# ------------------------------------------------------------------ config
 $cfgPath = Join-Path $env:USERPROFILE ".hx\config.json"
 $cfg = if (Test-Path $cfgPath) { Get-Content $cfgPath -Raw | ConvertFrom-Json } else { $null }
 
 function Pick($cli, $envName, $cfgValue) {
   if ($cli) { return $cli }
-  # ★ `$env:$envName` 是语法错误（env: 驱动不接受变量名插值），必须走 .NET。
+  # ★ `$env:$envName` is a syntax error (the env: drive does not interpolate a
+  #   variable name), so this has to go through .NET.
   $fromEnv = [Environment]::GetEnvironmentVariable($envName)
   if ($fromEnv) { return $fromEnv }
   if ($cfgValue) { return "$cfgValue" }
@@ -114,8 +126,8 @@ $url = Pick $BaseUrl "HX_BASE_URL" $cfg.baseUrl
 $mdl = Pick $Model   "HX_MODEL"    $cfg.model
 $key = Pick $ApiKey  "HX_API_KEY"  $cfg.apiKey
 if (-not $url -or -not $mdl) {
-  Write-Host "没有模型端点。给 -BaseUrl/-Model，或设 HX_BASE_URL/HX_MODEL，" -ForegroundColor Red
-  Write-Host "或写一个 $cfgPath：" -ForegroundColor Red
+  Write-Host "No model endpoint. Pass -BaseUrl/-Model, or set HX_BASE_URL/HX_MODEL," -ForegroundColor Red
+  Write-Host "or write a $cfgPath containing:" -ForegroundColor Red
   Write-Host '  { "baseUrl": "https://host/v1", "model": "your-model", "contextWindow": 32768 }' -ForegroundColor DarkGray
   exit 78
 }
@@ -126,11 +138,13 @@ $env:HX_BASE_URL = $url
 $env:HX_MODEL = $mdl
 if ($key) { $env:HX_API_KEY = $key }
 $env:HX_APPROVAL = $Approval
-# ★ 必须与服务端 n_ctx 对齐：设大了会被服务端静默截断（历史悄悄丢），
-#   设小了会过早压缩、白扔信息。llama.cpp 可以从 /props 读到真实值。
+# ★ Must match the server's n_ctx: set it too high and the server truncates
+#   silently (history quietly disappears); too low and compaction kicks in
+#   early, throwing information away for nothing. llama.cpp exposes the real
+#   value at /props.
 if ($ctx -gt 0) { $env:HX_CONTEXT_WINDOW = "$ctx" }
 
-# 自签证书
+# Self-signed certificate
 $pem = $CaCert
 if (-not $pem) {
   $h = ([Uri]$url).Host
@@ -142,7 +156,7 @@ if ($pem) {
   $env:NODE_EXTRA_CA_CERTS = (Resolve-Path $pem).Path
 }
 
-# ------------------------------------------------------------------ 跑
+# ------------------------------------------------------------------ run
 if (-not $Root) { $Root = (Get-Location).Path }
 $Root = (Resolve-Path $Root).Path
 

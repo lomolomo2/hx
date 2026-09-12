@@ -18,18 +18,19 @@
 namespace hx {
 namespace {
 
-// 把 errno 拼进消息，调用方只需关心字符串。
+// Fold errno into the message so callers only have to care about the string.
 std::string Err(const char* what) {
   return std::string(what) + ": " + ::strerror(errno);
 }
 
-// 读 /proc/self/cgroup，返回 cgroup v2（"0::"）那行的相对路径。
-// 统一层级（v2 only）时路径就是 hxd 所在 cgroup 的相对位置。
+// Read /proc/self/cgroup and return the relative path from the cgroup v2
+// ("0::") line. Under a unified hierarchy (v2 only) that path is hxd's own
+// cgroup's relative location.
 std::string SelfCgroupPath() {
   std::ifstream f("/proc/self/cgroup");
   std::string line;
   while (std::getline(f, line)) {
-    // 形如 "0::<path>"；v2 行以 "0::" 开头。
+    // Shaped like "0::<path>"; the v2 line starts with "0::".
     if (line.rfind("0::", 0) == 0) {
       return line.substr(3);
     }
@@ -37,7 +38,7 @@ std::string SelfCgroupPath() {
   return std::string();
 }
 
-// 找到 hxd 所在的 cgroup 绝对路径。找不到返回空串。
+// Find the absolute path of hxd's own cgroup. Empty string when not found.
 std::string OwnCgroupDir() {
   const std::string rel = SelfCgroupPath();
   if (rel.empty()) {
@@ -46,7 +47,7 @@ std::string OwnCgroupDir() {
   return "/sys/fs/cgroup" + rel;
 }
 
-// 向 cgroup 文件写一行。成功返回 true。
+// Write one line to a cgroup file. Returns true on success.
 bool WriteFile(const std::string& path, const std::string& value, std::string* err) {
   std::ofstream f(path);
   if (!f) {
@@ -62,7 +63,7 @@ bool WriteFile(const std::string& path, const std::string& value, std::string* e
   return true;
 }
 
-// 读 cgroup 文件全部内容（一行）。成功返回 true。
+// Read a cgroup file's entire contents (one line). Returns true on success.
 bool ReadFile(const std::string& path, std::string* out) {
   std::ifstream f(path);
   if (!f) {
@@ -72,15 +73,17 @@ bool ReadFile(const std::string& path, std::string* out) {
   return true;
 }
 
-// 子 cgroup 名带 pid，避免同一 scope 下多个 hxd 撞名。
-// ★ 探测与实际会话必须用不同的名字：同名时探测的 rmdir 会把会话的 cgroup 一起删掉。
+// The child cgroup's name carries the pid, so several hxd instances in one
+// scope do not collide.
+// ★ Probing and real sessions must use different names: sharing a name lets
+//   the probe's rmdir delete the session's cgroup along with its own.
 std::string ChildName(const char* kind) {
   char buf[64];
   ::snprintf(buf, sizeof(buf), "hx-%s-%d", kind, static_cast<int>(::getpid()));
   return buf;
 }
 
-// subtree_control 里是否已启用某控制器。
+// Whether a controller is already enabled in subtree_control.
 bool HasController(const std::string& parent, const char* name) {
   std::string cur;
   if (!ReadFile(parent + "/cgroup.subtree_control", &cur)) return false;
@@ -90,7 +93,7 @@ bool HasController(const std::string& parent, const char* name) {
 }  // namespace
 
 bool Cgroup2Usable(std::string* path, std::string* reason) {
-  // 1) 确认 /sys/fs/cgroup 是 cgroup2 文件系统。
+  // 1) Confirm /sys/fs/cgroup is a cgroup2 filesystem.
   struct statfs sfs {};
   if (::statfs("/sys/fs/cgroup", &sfs) != 0) {
     *reason = "statfs(/sys/fs/cgroup) failed";
@@ -101,23 +104,27 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
     return false;
   }
 
-  // 2) 找到 hxd 所在的 cgroup（父）。
+  // 2) Find hxd's own cgroup (the parent).
   const std::string parent = OwnCgroupDir();
   if (parent.empty()) {
     *reason = "cannot find own cgroup (no '0::' line in /proc/self/cgroup)";
     return false;
   }
 
-  // 3) 真正走一遍：建子 cgroup → 写 pids.max / memory.max。
-  //    子 cgroup 要能用控制器，前提是父的 subtree_control 里启用了它们。
-  //    父若已有内部进程（普通用户会话的典型情况），启用会 EBUSY —— 这正是
-  //    本函数要探测并如实报告的约束。
+  // 3) Actually walk it: create the child cgroup -> write pids.max /
+  //    memory.max. For the child to use the controllers, the parent's
+  //    subtree_control must have them enabled.
+  //    If the parent already has internal processes (the typical case in an
+  //    ordinary user session), enabling them gives EBUSY -- which is exactly
+  //    the constraint this function exists to probe and report honestly.
   const std::string child = parent + "/" + ChildName("probe");
   std::string err;
 
-  // ★ 探测必须无副作用：记下我们「新启用」了哪些控制器，结束时还原。
-  //   原实现在探测成功的机器上会把 +pids +memory 永久留在父 cgroup 上。
-  //   只还原自己加的 —— 用户本来就启用着的不能动。
+  // ★ Probing must have no side effects: record which controllers *we* newly
+  //   enabled and restore them at the end. The original implementation left
+  //   +pids +memory permanently on the parent cgroup of any machine where the
+  //   probe succeeded. Only undo what we added -- controllers the user already
+  //   had enabled must not be touched.
   const bool had_pids = HasController(parent, "pids");
   const bool had_memory = HasController(parent, "memory");
   const auto restore = [&]() {
@@ -126,11 +133,12 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
     if (!had_memory) WriteFile(parent + "/cgroup.subtree_control", "-memory", &ignored);
   };
 
-  // 先试启用 pids 与 memory。若父已启用过，再写一次无害；
-  // 若因内部进程 EBUSY，则说明这条链走不通。
+  // First try enabling pids and memory. If the parent already enabled them,
+  // writing again is harmless; if it gives EBUSY because of internal
+  // processes, this path does not work here.
   if (!WriteFile(parent + "/cgroup.subtree_control", "+pids +memory", &err)) {
     *reason = "enable subtree_control: " + err;
-    return false;  // 没启用成功，无需还原
+    return false;  // nothing was enabled, so there is nothing to restore
   }
 
   if (::mkdir(child.c_str(), 0755) != 0 && errno != EEXIST) {
@@ -139,9 +147,11 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
     return false;
   }
 
-  // 4) 验证两个限额文件真的存在、可写、且写后读回一致 —— "存在"不等于
-  //    "控制器已下发"。用保守值：子 cgroup 的 memory.max 不能高于父，
-  //    探测值太大可能假失败。
+  // 4) Verify both limit files really exist, are writable, and read back
+  //    matching what was written -- "it exists" is not "the controller was
+  //    delegated". Use conservative values: a child cgroup's memory.max
+  //    cannot exceed its parent's, and too large a probe value can fail
+  //    spuriously.
   if (!WriteFile(child + "/pids.max", "128", &err)) {
     ::rmdir(child.c_str());
     restore();
@@ -154,7 +164,8 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
     *reason = "memory.max: " + err;
     return false;
   }
-  // 读回确认限额真的生效（写成功但内核没接受的情况也能抓到）。
+  // Read back to confirm the limit really took effect (this also catches the
+  // case where the write succeeded but the kernel did not accept it).
   std::string back;
   if (!ReadFile(child + "/pids.max", &back) || back != "128") {
     ::rmdir(child.c_str());
@@ -169,10 +180,12 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
     return false;
   }
 
-  // 5) 探测成功：还原 subtree_control 并清理临时 cgroup。
+  // 5) The probe succeeded: restore subtree_control and clean up the
+  //    temporary cgroup.
   restore();
   if (::rmdir(child.c_str()) != 0 && errno != ENOENT) {
-    // 清理失败不影响"可用"结论，但记下来更诚实。
+    // A failed cleanup does not change the "usable" conclusion, but recording
+    // it is more honest.
     *reason = "usable (probe cgroup cleanup: " + Err("rmdir") + ")";
   } else {
     *reason = "ok";
@@ -183,10 +196,12 @@ bool Cgroup2Usable(std::string* path, std::string* reason) {
 
 Cgroup2Session::~Cgroup2Session() {
   if (active_ && !path_.empty()) {
-    // 子 cgroup 里若还有进程 rmdir 会 EBUSY；此时限额已失效（进程可能已跑完），
-    // 留一个空目录给 systemd/内核回收比报错更好。
+    // rmdir gives EBUSY while processes remain in the child cgroup; at that
+    // point the limits are moot anyway (the processes may already have
+    // finished), and leaving an empty directory for systemd/the kernel to
+    // reclaim beats erroring out.
     if (::rmdir(path_.c_str()) != 0 && errno != ENOENT && errno != EBUSY) {
-      // 静默：析构里不宜再抛。
+      // Silent: a destructor is no place to throw.
     }
   }
 }
@@ -203,7 +218,8 @@ bool Cgroup2Session::Create(const CgroupLimits& limits, std::string* err) {
     return false;
   }
 
-  // 启用父的 pids + memory 控制器（幂等：已启用再写无害）。
+  // Enable the parent's pids + memory controllers (idempotent: writing again
+  // when already enabled is harmless).
   if (!WriteFile(parent + "/cgroup.subtree_control", "+pids +memory", err)) {
     return false;
   }
@@ -214,7 +230,8 @@ bool Cgroup2Session::Create(const CgroupLimits& limits, std::string* err) {
     return false;
   }
 
-  // 只写非零的限额；0 表示该项不设限，就不动内核默认（max）。
+  // Only write non-zero limits; 0 means that entry is unlimited, so leave the
+  // kernel default (max) alone.
   if (limits.max_pids > 0) {
     char v[32];
     ::snprintf(v, sizeof(v), "%llu", static_cast<unsigned long long>(limits.max_pids));

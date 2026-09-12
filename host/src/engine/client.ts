@@ -1,8 +1,10 @@
-// 与 hxd 通信的唯一通道。
+// The single channel of communication with hxd.
 //
-// ★ 本文件是整个 host 里唯一允许 import node:child_process 的地方 ——
-//   它要做的事只有一件：把引擎这个"内核"拉起来。此后所有副作用都走 hxp 协议。
-//   其余任何文件出现 node:fs / node:child_process，都是在架构上开后门。
+// ★ This is the only file in the entire host allowed to import
+//   node:child_process -- it does exactly one thing: bring up the engine, the
+//   "kernel". Every side effect after that goes over the hxp protocol.
+//   node:fs or node:child_process appearing in any other file is an
+//   architectural back door.
 /* eslint-disable no-restricted-imports */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 /* eslint-enable no-restricted-imports */
@@ -60,7 +62,7 @@ export class EngineClient {
 
       if (isReply(msg)) {
         const pending = this.#pending.get(msg.reply_to);
-        if (!pending) continue; // 迟到的响应：请求已被放弃
+        if (!pending) continue; // a late response: the request was abandoned
         this.#pending.delete(msg.reply_to);
         if (msg.ok) pending.resolve(msg.result ?? {});
         else pending.reject(new HxError(msg.error?.code ?? "E_INTERNAL", msg.error?.message ?? "", msg.error?.detail));
@@ -70,7 +72,7 @@ export class EngineClient {
     }
   }
 
-  /** 每个请求恰好等到一个响应（协议 §1）。 */
+  /** Exactly one response per request (protocol section 1). */
   call(op: string, args?: Record<string, unknown>, replay: "never" | "safe" = "never"): Promise<Record<string, unknown>> {
     if (this.#closed) return Promise.reject(new Error("engine is closed"));
     const req: HxRequest = { id: `r${++this.#seq}`, op, replay };
@@ -91,7 +93,8 @@ export class EngineClient {
     this.#proc.stdin.end();
   }
 
-  // ---- 便捷封装。每一个都对应 proto/hxp-v0.md 里的一个 op ----
+  // ---- Convenience wrappers. Each corresponds to one op in
+  //      proto/hxp-v0.md ----
 
   selfTest() {
     return this.call("selftest", undefined, "safe");

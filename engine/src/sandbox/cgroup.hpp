@@ -1,15 +1,20 @@
-// cgroup v2 会话级资源隔离。
+// Session-level resource isolation via cgroup v2.
 //
-// 为什么需要它（见 exec/rlimit.hpp 的说明）：
-//   rlimit 只是缓解不是隔离，RLIMIT_NPROC 按真实 UID 计数，会波及用户的其它进程。
-//   cgroup v2 的 pids.max / memory.max 只作用于该 cgroup，才是真正的按沙箱限额。
+// Why it is needed (see the notes in exec/rlimit.hpp):
+//   rlimits are mitigation rather than isolation, and RLIMIT_NPROC counts by
+//   real UID, so it spills over onto the user's other processes. cgroup v2's
+//   pids.max / memory.max apply only to that cgroup, which is what a genuine
+//   per-sandbox quota looks like.
 //
-// 必须处理的约束 —— cgroup v2 的「无内部进程」规则：
-//   一个已经有进程的 cgroup 不能再为它的子 cgroup 启用控制器。普通用户会话里
-//   hxd 与 shell 同处一个 scope，往该 scope 的 cgroup.subtree_control 写
-//   "+pids +memory" 会 EBUSY（已在目标机器实测）。所以本模块必须能**探测**出
-//   到底能不能建出真正带 pids.max + memory.max 的子 cgroup，不能时干净地降级，
-//   绝不假装限额已生效。
+// The constraint that has to be handled -- cgroup v2's "no internal processes"
+// rule:
+//   A cgroup that already contains processes cannot enable controllers for its
+//   children. In an ordinary user session hxd shares a scope with the shell,
+//   and writing "+pids +memory" to that scope's cgroup.subtree_control gives
+//   EBUSY (measured on the target machine). So this module must be able to
+//   **probe** whether a child cgroup carrying real pids.max + memory.max can
+//   be created at all, degrade cleanly when it cannot, and never pretend the
+//   limits took effect.
 #pragma once
 
 #include <sys/types.h>
@@ -19,28 +24,34 @@
 
 namespace hx {
 
-// 会话级 cgroup 限额。0 表示该项不设限。
+// Session-level cgroup limits. 0 means that entry is unlimited.
 struct CgroupLimits {
   uint64_t max_pids = 0;         // pids.max
   uint64_t max_memory_bytes = 0; // memory.max
 };
 
 /**
- * 探测 hxd 当前能否建出一个真正带 pids.max + memory.max 的子 cgroup。
+ * Probe whether hxd can currently create a child cgroup carrying real
+ * pids.max + memory.max.
  *
- * 这是"能否真限额"的唯一权威答案：它会实际走一遍
- *   启用父控制器 → 建子 cgroup → 写 pids.max/memory.max
- * 的完整流程，任一步失败（典型是父 scope 有内部进程导致 EBUSY）即返回 false。
- * 探测用的临时 cgroup 会在返回前清理掉。
+ * This is the one authoritative answer to "can limits really be applied": it
+ * actually walks the full sequence
+ *   enable the parent's controllers -> create the child cgroup -> write
+ *   pids.max/memory.max
+ * and returns false if any step fails (typically EBUSY because the parent
+ * scope has internal processes). The temporary cgroup used for probing is
+ * cleaned up before returning.
  *
- * 成功返回 true 并把可用子 cgroup 的示例路径写入 *path；
- * 失败返回 false 并把原因写入 *reason（便于 --self-test 诚实报告）。
+ * On success returns true and writes an example usable child cgroup path to
+ * *path; on failure returns false and writes the reason to *reason (so
+ * --self-test can report honestly).
  */
 bool Cgroup2Usable(std::string* path, std::string* reason);
 
 /**
- * RAII 的 per-session cgroup：构造不做事，Create 建 cgroup 并设限额，
- * 析构时把子 cgroup 移除。无裸 new/delete。
+ * An RAII per-session cgroup: the constructor does nothing, Create makes the
+ * cgroup and sets the limits, and the destructor removes the child cgroup. No
+ * raw new/delete.
  */
 class Cgroup2Session {
 public:
@@ -50,14 +61,17 @@ public:
   Cgroup2Session(const Cgroup2Session&) = delete;
   Cgroup2Session& operator=(const Cgroup2Session&) = delete;
 
-  // 建一个子 cgroup 并写入 limits 里的限额。成功返回 true（此后 Active() 为真）。
-  // 失败返回 false 并填 *err，此时本对象等价于未创建。
+  // Create a child cgroup and write the limits into it. Returns true on
+  // success (after which Active() is true). On failure returns false with *err
+  // filled in, and this object is equivalent to never having been created.
   bool Create(const CgroupLimits& limits, std::string* err);
 
-  // 把一个 pid 移进本 cgroup（写 cgroup.procs）。失败返回 false 并填 *err。
+  // Move a pid into this cgroup (by writing cgroup.procs). Returns false with
+  // *err filled in on failure.
   bool AddPid(pid_t pid, std::string* err);
 
-  // 限额是否真的建好了。未建好时调用方应视为"没有 cgroup 隔离"。
+  // Whether the limits were really established. When they were not, the caller
+  // must treat it as "no cgroup isolation".
   bool Active() const { return active_; }
   const std::string& Path() const { return path_; }
 

@@ -1,19 +1,22 @@
-// 审批回路：ask → 挂起 → 问 → 恢复。
+// The approval loop: ask -> suspend -> question -> resume.
 //
-// 设计上的两个决定：
+// Two design decisions:
 //
-// 1. 非交互环境下 ask 等价于 deny，而不是 allow。
-//    没人能回答的时候放行，等于这条规则从来没存在过。
+// 1. In a non-interactive environment ask is equivalent to deny, not allow.
+//    Allowing something when nobody can answer is the same as the rule never
+//    having existed.
 //
-// 2. 被拒绝的结果要「喂回模型」，不是抛异常。
-//    模型需要知道"这条路被用户堵死了"，才会去想别的办法；
-//    抛异常只会让整轮失败，用户还得从头再来。
+// 2. A denial is *fed back to the model*, not thrown.
+//    The model needs to know "the user has closed off this route" in order to
+//    think of another one; throwing just fails the whole turn and the user has
+//    to start over.
 export interface ApprovalRequest {
   id: string;
   tool: string;
-  /** 参与策略匹配的主体，通常是命令行或文件路径 */
+  /** The subjects policy matching runs against, usually a command line or file
+   *  path */
   subjects: string[];
-  /** 给人看的预览：命令原文、补丁摘要 */
+  /** The preview shown to a human: the command verbatim, a patch summary */
   preview: string;
 }
 
@@ -21,7 +24,7 @@ export type ApprovalDecision = "allow_once" | "allow_always" | "deny";
 
 export type ApprovalHandler = (req: ApprovalRequest) => Promise<ApprovalDecision>;
 
-/** 没有 handler 时的默认行为：拒绝，并说清楚原因。 */
+/** The default behaviour with no handler: deny, and say why. */
 export const denyingHandler: ApprovalHandler = async () => "deny";
 
 export function denialMessage(tool: string, preview: string): string {

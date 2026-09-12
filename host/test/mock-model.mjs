@@ -1,16 +1,21 @@
-// 一个最小的 OpenAI 兼容端点，用来在没有真模型的情况下把整条 CLI 通路跑通。
+// A minimal OpenAI-compatible endpoint, for exercising the whole CLI path
+// without a real model.
 //
-//   node test/mock-model.mjs            # 监听 127.0.0.1:4399
+//   node test/mock-model.mjs            # listens on 127.0.0.1:4399
 //   PORT=5000 node test/mock-model.mjs
 //
-// ★ 它替换掉的只有「下一步做什么」这个决策 —— 而那本来就是模型的职责。
-//   hx-host 的其余部分完全走真实路径：装配上下文、构造提示词、发 HTTP、
-//   解析 tool_calls、过策略与审批、经 hxp 调引擎、把工具结果喂回去。
-//   所以这不是"假装成功"，而是把不确定的那一环换成确定的，
-//   剩下的部分该坏还是会坏。
+// ★ The only thing it replaces is the decision of "what to do next" -- which
+//   is precisely the model's job. Every other part of hx-host takes the real
+//   path: assembling context, building the prompt, sending HTTP, parsing
+//   tool_calls, going through policy and approval, calling the engine over
+//   hxp, and feeding tool results back.
+//   So this is not "faking success"; it swaps the one uncertain link for a
+//   deterministic one, and everything else still breaks when it is broken.
 //
-// 剧本固定：列计划 -> 跑测试(失败) -> 读文件 -> 打补丁 -> 再跑(通过) -> 收尾。
-// 配套夹具见 test/fixtures.ts（Windows 用 PowerShell，Linux 用 Python）。
+// The script is fixed: make a plan -> run the tests (fail) -> read the file ->
+// apply a patch -> run again (pass) -> wrap up.
+// The matching fixtures are in test/fixtures.ts (PowerShell on Windows, Python
+// on Linux).
 import { createServer } from "node:http";
 
 const PORT = Number(process.env.PORT ?? 4399);
@@ -45,7 +50,7 @@ const PATCH = isWindows
       "",
     ].join("\n");
 
-/** 历史里已经有几轮 assistant，就是走到第几步了。 */
+/** However many assistant turns the history already holds is the step we are on. */
 function step(messages) {
   return messages.filter((m) => m.role === "assistant").length;
 }
@@ -82,7 +87,7 @@ const server = createServer((req, res) => {
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
-      /* 空请求也给个回复，免得客户端挂住 */
+      /* answer even an empty request, so the client does not hang */
     }
     const n = step(parsed.messages ?? []);
     let out;

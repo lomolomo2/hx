@@ -1,20 +1,24 @@
-// 约束载体（confinement）—— 沙箱层的平台 seam。
+// The confinement carrier -- the platform seam of the sandbox layer.
 //
-// 两个平台的「内核强制」形状完全不同，但**契约相同**：
+// "Kernel enforcement" takes completely different shapes on the two
+// platforms, but **the contract is the same**:
 //
-//   Linux    Landlock ruleset fd。父进程构建，fork 之后在子进程里
-//            landlock_restrict_self()，然后 execve。
-//            allow-list：没授予就是拒绝。
+//   Linux    A Landlock ruleset fd. The parent builds it; after fork the child
+//            calls landlock_restrict_self(), then execve.
+//            An allow-list: not granted means denied.
 //
-//   Windows  AppContainer。父进程派生一个每会话唯一的 AppContainer SID，
-//            在 roots 上打 ACE，CreateProcess 时通过
-//            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES 把 token 降进去。
-//            同样是 allow-list：AppContainer 进程只能访问 DACL 里明确
-//            授予了它的 SID（或 ALL APPLICATION PACKAGES）的对象。
+//   Windows  An AppContainer. The parent derives a per-session unique
+//            AppContainer SID, stamps ACEs on the roots, and drops the token
+//            in at CreateProcess time via
+//            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES.
+//            Also an allow-list: an AppContainer process can only reach
+//            objects whose DACL explicitly grants its SID (or ALL APPLICATION
+//            PACKAGES).
 //
-// ★ 两边共有的那条不变式必须留住：**装不上就不执行**。
-//   enforced == false 且策略不是 danger-full-access 时，调用方必须拒绝起进程，
-//   绝不降级为无保护运行。
+// ★ The invariant shared by both sides must be preserved: **if it cannot be
+//   applied, do not execute**. When enforced == false and the policy is not
+//   danger-full-access, the caller must refuse to start the process and never
+//   degrade to running unprotected.
 #pragma once
 
 #include <memory>
@@ -27,22 +31,24 @@
 namespace hx {
 
 /**
- * 平台私有的约束对象。
+ * The platform-private confinement object.
  *
- * 故意只在这里前置声明：engine.cpp 不该知道它是一个 fd 还是一个 SID。
- * 定义在 confine_posix.hpp / confine_win.hpp，只有对应平台的 spawn 会包。
+ * Deliberately only forward-declared here: engine.cpp has no business knowing
+ * whether it is an fd or a SID. It is defined in confine_posix.hpp /
+ * confine_win.hpp, and only the matching platform's spawn includes it.
  */
 struct Confinement;
 
 struct RulesetBuild {
-  /** 空 = 不施加（danger-full-access，或内核不支持而已在 warnings 里说明）。 */
+  /** Null = not applied (danger-full-access, or the kernel does not support it
+   *  and that is already explained in warnings). */
   std::shared_ptr<Confinement> conf;
-  bool enforced = false;              // 是否真的会有内核强制
-  bool net_enforced = false;          // 网络限制是否真的生效
-  std::vector<std::string> warnings;  // 降级说明，必须如实上报给 host
+  bool enforced = false;              // whether there will really be kernel enforcement
+  bool net_enforced = false;          // whether the network restriction really takes effect
+  std::vector<std::string> warnings;  // degradation notes; must be reported honestly to the host
 };
 
-/** 在父进程构建。返回的对象可被多次 spawn 复用。 */
+/** Built in the parent. The returned object can be reused across spawns. */
 RulesetBuild BuildConfinement(const Policy& p, const Caps& caps);
 
 }  // namespace hx

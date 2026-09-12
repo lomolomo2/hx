@@ -27,7 +27,8 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
   ws.ws_col = req.cols;
 
   int master = -1;
-  // forkpty 会建好 pty 对、在子进程里 setsid 并把从端接到 0/1/2
+  // forkpty creates the pty pair, calls setsid in the child, and wires the
+  // slave end to 0/1/2
   const pid_t pid = ::forkpty(&master, nullptr, nullptr, &ws);
   if (pid < 0) {
     r.error = std::string("forkpty: ") + ::strerror(errno);
@@ -35,7 +36,7 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
   }
 
   if (pid == 0) {
-    // ---- 子进程。施加顺序与管道版完全一致 ----
+    // ---- child. The order of application is identical to the pipe flavour ----
     if (!req.cwd.empty() && ::chdir(req.cwd.c_str()) != 0) {
       ::fprintf(stderr, "hxd: chdir: %s\r\n", ::strerror(errno));
       ::_exit(126);
@@ -50,7 +51,7 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
       ::fprintf(stderr, "hxd: rlimit: %s\r\n", err.c_str());
       ::_exit(126);
     }
-    // seccomp 最后装，否则会挡掉上面这些
+    // seccomp goes last, or it would block the steps above
     if (!ApplySeccomp(req.seccomp, &err)) {
       ::fprintf(stderr, "hxd: seccomp: %s\r\n", err.c_str());
       ::_exit(126);
@@ -71,10 +72,10 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
     ::_exit(127);
   }
 
-  // ---- 父进程 ----
+  // ---- parent ----
   r.ok = true;
-  r.proc.pid = pid;  // forkpty 内部已 setsid，pgid == pid
-  // Linux 的 pty 主端读写同一个 fd
+  r.proc.pid = pid;  // forkpty already called setsid, so pgid == pid
+  // On Linux the pty master is read and written through the same fd
   r.master_out = master;
   r.master_in = master;
   return r;

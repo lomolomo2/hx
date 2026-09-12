@@ -19,18 +19,20 @@ namespace hx {
 namespace win_spawn {
 
 /**
- * argv -> 命令行字符串。
+ * argv -> command-line string.
  *
- * ★ Windows 没有 execve(argv[])：CreateProcess 只收一个字符串，
- *   由子进程自己（通常用 CommandLineToArgvW）再拆回来。也就是说
- *   **引号规则是这一层的安全边界**。拼错了，argv 里一个带空格或引号的
- *   文件名就会被拆成两个参数 —— 那正是 grep.ts 注释里担心的那类注入口子，
- *   只不过发生在 Windows 侧而不是 shell 里。
+ * ★ Windows has no execve(argv[]): CreateProcess takes a single string, and
+ *   the child splits it back apart itself (usually with CommandLineToArgvW).
+ *   Which means **the quoting rules are this layer's security boundary**. Get
+ *   them wrong and a filename in argv containing a space or a quote is split
+ *   into two arguments -- precisely the class of injection hole the comments
+ *   in grep.ts worry about, only happening on the Windows side rather than in
+ *   a shell.
  *
- * 规则（与 CommandLineToArgvW 严格互逆）：
- *   · 含空格 / 制表符 / 引号 / 为空 -> 整体加引号
- *   · 引号前的反斜杠要成对加倍
- *   · 内嵌引号前再加一个反斜杠
+ * The rules (the strict inverse of CommandLineToArgvW):
+ *   - contains space / tab / quote, or is empty -> wrap the whole thing in quotes
+ *   - backslashes preceding a quote must be doubled
+ *   - an embedded quote gets one more backslash in front of it
  */
 std::wstring ArgvToCommandLine(const std::vector<std::string>& argv) {
   std::wstring out;
@@ -51,7 +53,7 @@ std::wstring ArgvToCommandLine(const std::vector<std::string>& argv) {
         ++j;
       }
       if (j == a.size()) {
-        out.append(slashes * 2, L'\\');  // 结尾的反斜杠要加倍，否则会转义收尾引号
+        out.append(slashes * 2, L'\\');  // trailing backslashes must double, or they escape the closing quote
         break;
       }
       if (a[j] == L'"') {
@@ -67,21 +69,26 @@ std::wstring ArgvToCommandLine(const std::vector<std::string>& argv) {
 }
 
 /**
- * cmd.exe 的命令行要另外拼，**不能**用 ArgvToCommandLine。
+ * cmd.exe's command line has to be built separately -- ArgvToCommandLine
+ * **must not** be used for it.
  *
- * ★ 这是 Windows 上最阴的一条规则差异：
- *   CreateProcess 传的是一整条字符串，绝大多数程序用 CommandLineToArgvW
- *   把它拆回 argv —— 那套规则里内嵌引号写成 \"。但 **cmd.exe 不用那套规则**：
- *   它把反斜杠当普通字符，引号只做简单配对。
+ * ★ This is the nastiest rule difference on Windows:
+ *   CreateProcess is handed one whole string, and the overwhelming majority of
+ *   programs split it back into argv with CommandLineToArgvW -- under those
+ *   rules an embedded quote is written \". But **cmd.exe does not use those
+ *   rules**: it treats a backslash as an ordinary character and merely pairs
+ *   quotes up.
  *
- *   于是 ["cmd","/c","powershell -Command \"...\""] 按通用规则拼出来，
- *   cmd 看到的是一堆字面的 \" ，传给 powershell 的命令变成了一个**字符串
- *   字面量**。实测现象是 powershell 把命令原文回显出来，退出码 0，
- *   看起来"跑成功了"，只是什么都没做 —— 又一个静默失败。
+ *   So ["cmd","/c","powershell -Command \"...\""] assembled by the general
+ *   rules leaves cmd looking at a pile of literal \" characters, and the
+ *   command handed to powershell becomes a **string literal**. The observed
+ *   symptom is powershell echoing the command text back and exiting 0, looking
+ *   like it "ran fine" while doing nothing at all -- another silent failure.
  *
- *   正确做法是 `/s`：加上它之后，cmd 只把 /c 后面的第一个和最后一个引号
- *   剥掉，中间原样不动。于是我们只要把命令整体包一层引号，
- *   内部引号一个都不用转义。
+ *   The right approach is `/s`: with it, cmd strips only the first and last
+ *   quote after /c and leaves everything between them untouched. So all we
+ *   have to do is wrap the command in one layer of quotes, with no escaping of
+ *   the inner quotes at all.
  */
 bool IsCmdExe(const std::wstring& exe) {
   size_t slash = exe.find_last_of(L"\\/");
@@ -90,7 +97,8 @@ bool IsCmdExe(const std::wstring& exe) {
   return name == L"cmd.exe";
 }
 
-/** 返回 true 表示已按 cmd.exe 的规则拼好；false 表示该走通用路径。 */
+/** Returns true when it has been assembled under cmd.exe's rules; false means
+ *  take the general path. */
 bool BuildCmdExeCommandLine(const std::wstring& exe, const std::vector<std::string>& argv,
                             std::wstring* out) {
   if (!IsCmdExe(exe) || argv.size() < 3) return false;
@@ -103,17 +111,21 @@ bool BuildCmdExeCommandLine(const std::wstring& exe, const std::vector<std::stri
     if (i > 2) body.push_back(L' ');
     body += win::Widen(argv[i]);
   }
-  // cmd 会剥掉最外层的一对引号；命令自己末尾带引号时会误判，补一个空格隔开。
+  // cmd strips the outermost pair of quotes; when the command itself ends in a
+  // quote that goes wrong, so separate them with a space.
   if (!body.empty() && body.back() == L'"') body.push_back(L' ');
 
   *out = L"cmd.exe /s " + sw + L" \"" + body + L"\"";
   return true;
 }
 
-/** "K=V" 列表 -> CreateProcess 的环境块（\0 分隔，末尾双 \0）。 */
+/** A list of "K=V" -> CreateProcess's environment block (\0-separated,
+ *  terminated by a double \0). */
 std::wstring BuildEnvBlock(const std::vector<std::string>& envp) {
-  // Windows 要求环境块按变量名不区分大小写排序。不排在多数情况下也能跑，
-  // 但个别运行时（含一些 MSVC 工具）会二分查找，乱序时表现为「变量明明设了却读不到」。
+  // Windows requires the environment block to be sorted by variable name,
+  // case-insensitively. Leaving it unsorted works most of the time, but some
+  // runtimes (including a few MSVC tools) binary-search it, and out of order
+  // that shows up as "the variable is clearly set yet cannot be read".
   std::vector<std::wstring> items;
   items.reserve(envp.size());
   for (const auto& e : envp) items.push_back(win::Widen(e));
@@ -125,11 +137,11 @@ std::wstring BuildEnvBlock(const std::vector<std::string>& envp) {
     block += it;
     block.push_back(L'\0');
   }
-  block.push_back(L'\0');  // 空环境时也必须是双 \0
+  block.push_back(L'\0');  // even an empty environment needs the double \0
   return block;
 }
 
-/** 从 envp 里取 PATH（大小写不敏感）。 */
+/** Pull PATH out of envp (case-insensitively). */
 std::wstring PathFromEnv(const std::vector<std::string>& envp) {
   for (const auto& e : envp) {
     const size_t eq = e.find('=');
@@ -142,43 +154,48 @@ std::wstring PathFromEnv(const std::vector<std::string>& envp) {
 }
 
 /**
- * 解析可执行文件的绝对路径。
+ * Resolve the executable's absolute path.
  *
- * ★ 为什么不把 lpApplicationName 留空让 CreateProcess 自己找：
- *   它用的是**调用方**（hxd）的 PATH，而我们刻意给子进程换了一份最小环境。
- *   留空的话 envp 里的 PATH 形同虚设 —— 沙箱里跑的是宿主 PATH 上的程序，
- *   与策略里写的那份不是一回事。自己用 envp 的 PATH 查，才对得上。
+ * ★ Why not leave lpApplicationName null and let CreateProcess find it:
+ *   it searches the **caller's** PATH (hxd's), while we deliberately gave the
+ *   child a different, minimal environment. Left null, the PATH in envp is
+ *   decorative -- what runs in the sandbox is a program from the host's PATH,
+ *   which is not the same thing the policy describes. Searching envp's PATH
+ *   ourselves is what makes the two agree.
  */
 bool ResolveExecutable(const std::string& prog, const std::vector<std::string>& envp,
                        const std::string& cwd, std::wstring* out) {
   const std::wstring wprog = win::Widen(prog);
   const std::wstring path = PathFromEnv(envp);
 
-  // 带分隔符的当相对/绝对路径解析，不查 PATH（与 execvp 的行为一致）
+  // Anything containing a separator resolves as a relative/absolute path and
+  // does not consult PATH (matching execvp's behaviour)
   const bool has_sep = prog.find('/') != std::string::npos || prog.find('\\') != std::string::npos;
 
-  // 带分隔符时在 cwd 下解析，否则沿 envp 的 PATH 查。
+  // With a separator, resolve under cwd; otherwise search along envp's PATH.
   const std::wstring wcwd = win::Widen(cwd);
   const wchar_t* search_root = has_sep ? (wcwd.empty() ? nullptr : wcwd.c_str())
                                        : (path.empty() ? nullptr : path.c_str());
 
-  // ★ 绝不能先试「不补扩展名」。
+  // ★ Never try "no extension appended" first.
   //
-  //   POSIX 的 execvp 找的就是无扩展名的可执行文件，照搬过来是错的：
-  //   Windows 上无扩展名的文件根本不可执行，而 PATH 上常常躺着同名的
-  //   shell 脚本（MSYS/Git-Bash 就在 bin 下放了一堆）。实测 "cmd" 会先
-  //   命中 C:\MinGW\msys\1.0\bin\cmd 这个脚本，而不是 System32\cmd.exe。
+  //   POSIX's execvp looks for an extensionless executable, and copying that
+  //   over is wrong: on Windows an extensionless file is not executable at
+  //   all, while PATH very often carries same-named shell scripts (MSYS and
+  //   Git-Bash drop a pile of them into bin). Measured: "cmd" first hits the
+  //   script C:\MinGW\msys\1.0\bin\cmd rather than System32\cmd.exe.
   //
-  //   SearchPathW 的 lpExtension 只在「文件名本身没有扩展名」时才追加，
-  //   所以按 PATHEXT 顺序依次传就同时覆盖了两种写法：
-  //     "cmd"      -> 补成 cmd.exe
-  //     "node.exe" -> 已有扩展名，原样查
+  //   SearchPathW's lpExtension is only appended when "the filename itself has
+  //   no extension", so passing the PATHEXT entries in order covers both
+  //   spellings at once:
+  //     "cmd"      -> completed to cmd.exe
+  //     "node.exe" -> already has an extension, searched as-is
   const wchar_t* kExts[] = {L".exe", L".com", L".bat", L".cmd"};
   std::wstring buf(MAX_PATH, L'\0');
   for (const wchar_t* ext : kExts) {
     DWORD n = ::SearchPathW(search_root, wprog.c_str(), ext, static_cast<DWORD>(buf.size()),
                             buf.data(), nullptr);
-    if (n >= buf.size()) {  // 缓冲不够，n 是需要的长度
+    if (n >= buf.size()) {  // buffer too small; n is the required length
       buf.assign(static_cast<size_t>(n) + 1, L'\0');
       n = ::SearchPathW(search_root, wprog.c_str(), ext, static_cast<DWORD>(buf.size()),
                         buf.data(), nullptr);
@@ -193,7 +210,7 @@ bool ResolveExecutable(const std::string& prog, const std::vector<std::string>& 
   return false;
 }
 
-/** CreateProcess 的公共部分。成功时填好 proc。 */
+/** The part of CreateProcess shared by both paths. Fills in proc on success. */
 bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
             const std::vector<std::string>& envp, const Confinement* conf, const Limits& limits,
             HANDLE child_in, HANDLE child_out, HANDLE child_err, HPCON pcon, Proc* proc,
@@ -209,12 +226,14 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
     return false;
   }
   std::wstring cmdline;
-  // cmd.exe 的引号规则与 CommandLineToArgvW 不同，必须另拼 —— 见 BuildCmdExeCommandLine
+  // cmd.exe's quoting rules differ from CommandLineToArgvW's, so it has to be
+  // assembled separately -- see BuildCmdExeCommandLine
   if (!BuildCmdExeCommandLine(exe, argv, &cmdline)) cmdline = ArgvToCommandLine(argv);
   std::wstring envblock = BuildEnvBlock(envp);
-  // HX_DEBUG_SPAWN=1 时把真正交给 CreateProcess 的东西原样打出来。
-  // 排查「命令在壳里能跑、在沙箱里不行」这类问题时，第一件事就是确认
-  // exe / cmdline / env 三者到底是什么 —— 猜是最慢的办法。
+  // With HX_DEBUG_SPAWN=1, print verbatim what is actually handed to
+  // CreateProcess. When diagnosing "the command runs in a shell but not in the
+  // sandbox", the first thing to establish is what exe / cmdline / env really
+  // are -- guessing is the slowest way there.
   if (std::string dbg; platform::GetEnv("HX_DEBUG_SPAWN", &dbg)) {
     std::fprintf(stderr, "hxd/debug: exe=[%s]\n", win::Narrow(exe).c_str());
     std::fprintf(stderr, "hxd/debug: cmdline=[%s]\n", win::Narrow(cmdline).c_str());
@@ -224,7 +243,8 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
   }
   const std::wstring wcwd = win::Widen(cwd);
 
-  // ---- Job：先建好、先装限额，进程一进来就已经被圈住 ----
+  // ---- Job: created and limited up front, so a process is fenced in the
+  //      moment it joins ----
   HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
   if (job == nullptr) {
     *error = win::LastError("CreateJobObject");
@@ -235,9 +255,10 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
     return false;
   }
 
-  // ---- 进程属性表 ----
+  // ---- process attribute list ----
   SIZE_T attr_size = 0;
-  // 属性数：安全能力（有沙箱时）、句柄白名单（非 pty 时）、伪控制台（pty 时）
+  // Attribute count: security capabilities (when sandboxed), the handle
+  // allowlist (when not a pty), the pseudoconsole (when it is)
   DWORD attr_count = 1;
   if (conf != nullptr) ++attr_count;
   ::InitializeProcThreadAttributeList(nullptr, attr_count, 0, &attr_size);
@@ -254,10 +275,12 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
 
   SECURITY_CAPABILITIES sec{};
   if (conf != nullptr) {
-    // ★ 这一步就是 Windows 上的 landlock_restrict_self。
-    //   差别在时机：Linux 是子进程 fork 之后自己降权（所以顺序错了会留窗口期），
-    //   Windows 是父进程在建进程时把 token 定死，子进程连第一条指令都还没执行。
-    //   没有窗口期可言，也就没有「顺序错了等于没做」这个坑。
+    // ★ This step is landlock_restrict_self's counterpart on Windows.
+    //   The difference is timing: on Linux the child drops its own privileges
+    //   after fork (so a wrong order leaves a window), while on Windows the
+    //   parent fixes the token at process-creation time, before the child has
+    //   executed its first instruction. There is no window to speak of, and
+    //   therefore no "wrong order means it never happened" trap.
     if (!FillSecurityCapabilities(*conf, &sec)) {
       *error = "FillSecurityCapabilities failed";
       ::CloseHandle(job);
@@ -274,7 +297,8 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
   HANDLE inherit[3];
   DWORD inherit_n = 0;
   if (pcon != nullptr) {
-    // pty 路径：伪控制台自带 stdio，不走句柄白名单
+    // pty path: the pseudoconsole brings its own stdio and does not go through
+    // the handle allowlist
     if (::UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, pcon,
                                     sizeof(pcon), nullptr, nullptr) == 0) {
       *error = win::LastError("UpdateProcThreadAttribute(pseudoconsole)");
@@ -282,10 +306,11 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
       return false;
     }
   } else {
-    // ★ 句柄白名单 = O_CLOEXEC 的对位。
-    //   CreateProcess 的 bInheritHandles=TRUE 会把**所有**可继承句柄一起给出去。
-    //   不显式列白名单的话，另一个 cell 的管道端就可能漏进这个子进程 ——
-    //   两个本该互不可见的沙箱之间凭空多出一条通道。
+    // ★ The handle allowlist is the counterpart of O_CLOEXEC.
+    //   CreateProcess with bInheritHandles=TRUE hands over **every**
+    //   inheritable handle. Without an explicit allowlist, another cell's pipe
+    //   end can leak into this child -- conjuring a channel between two
+    //   sandboxes that are supposed to be invisible to each other.
     if (child_in != INVALID_HANDLE_VALUE) inherit[inherit_n++] = child_in;
     if (child_out != INVALID_HANDLE_VALUE) inherit[inherit_n++] = child_out;
     if (child_err != INVALID_HANDLE_VALUE) inherit[inherit_n++] = child_err;
@@ -310,34 +335,44 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
 
   PROCESS_INFORMATION pi{};
   DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                // ★ 挂起着建。AssignProcessToJobObject 必须赶在子进程跑起来之前，
-                //   否则它有机会在入 Job 前 fork 出逃出限额的孙进程。
+                // ★ Create it suspended. AssignProcessToJobObject has to land
+                //   before the child starts running, or it gets a chance to
+                //   fork grandchildren outside the limits before joining the
+                //   Job.
                 CREATE_SUSPENDED |
-                // 自成进程组：这是 SignalGroup 能送 CTRL_BREAK 的前提，
-                // 也让子进程不会收到我们这个控制台的 Ctrl+C。
+                // Its own process group: the prerequisite for SignalGroup
+                // being able to deliver CTRL_BREAK, and it also keeps the
+                // child from receiving Ctrl+C from our console.
                 CREATE_NEW_PROCESS_GROUP;
-  // ★ 必须是 CREATE_NO_WINDOW，**不能**用 DETACHED_PROCESS。这里踩过一次，值得写全。
+  // ★ It must be CREATE_NO_WINDOW; DETACHED_PROCESS **must not** be used.
+  //   This one was learned the hard way and is worth writing out in full.
   //
-  //   两者都不弹窗，区别是要不要给子进程配一个控制台。配了控制台，系统会
-  //   顺带塞一个 conhost.exe 进我们的 Job —— 它在客户端退出后还活一小会儿，
-  //   于是每条普通命令都被判成「留下了孤儿进程」。为了躲开这个，
-  //   一度改成了 DETACHED_PROCESS（反正三条 stdio 都重定向了，看似不需要控制台）。
+  //   Neither pops up a window; the difference is whether the child gets a
+  //   console. With a console, the system also slips a conhost.exe into our
+  //   Job -- and it outlives its client by a moment, so every ordinary command
+  //   gets judged to have "left orphan processes behind". To dodge that, this
+  //   was briefly changed to DETACHED_PROCESS (all three stdio streams are
+  //   redirected anyway, so a console looked unnecessary).
   //
-  //   结果是一次**静默**的塌方：cmd.exe 自己照样跑，echo / type 这些**内建**
-  //   命令也照常有输出，但 cmd 再去起的任何**外部**程序（node / ping /
-  //   powershell）全部拿不到 stdout —— 退出码 0 或 1，一个字节都不输出。
-  //   也就是说「跑一条命令」看着是好的，「跑一条真实的构建命令」全废。
-  //   这正是 README 那条教训的翻版：冒烟用例恰好只用了内建命令，于是
-  //   套件全绿而实际工作全灭。
+  //   The result was a **silent** collapse: cmd.exe itself still ran, and
+  //   **builtins** like echo / type still produced output, but any **external**
+  //   program cmd then started (node / ping / powershell) got no stdout at all
+  //   -- exit code 0 or 1 and not one byte of output. Which is to say
+  //   "run a command" looked fine while "run a real build command" was
+  //   entirely broken. This is a replay of the README's lesson: the smoke
+  //   cases happened to use only builtins, so the suite was green while the
+  //   actual work was dead.
   //
-  //   conhost 的问题改在别处解决：GroupAlive 按镜像路径把它排除掉
-  //   （见 exec/proc_win.cpp），那里既精确，又不碰任何执行路径。
+  //   The conhost problem is solved elsewhere instead: GroupAlive excludes it
+  //   by image path (see exec/proc_win.cpp), which is both precise and touches
+  //   no execution path at all.
   if (pcon == nullptr) flags |= CREATE_NO_WINDOW;
 
-  // ★ 这里刻意没有任何「关掉沙箱」的调试开关。
-  //   诊断开关只该是只读的（HX_DEBUG_SPAWN 只打印）。一个能用环境变量
-  //   摘掉 AppContainer 的旁路，本身就是一条提权通道 —— 而且是最容易
-  //   被忘在生产二进制里的那种。
+  // ★ There is deliberately no "turn the sandbox off" debug switch here.
+  //   Diagnostic switches should be read-only (HX_DEBUG_SPAWN only prints). A
+  //   bypass that drops AppContainer via an environment variable is itself a
+  //   privilege-escalation channel -- and exactly the kind most easily left
+  //   behind in a production binary.
   if (::CreateProcessW(exe.c_str(), cmdline.data(), nullptr, nullptr,
                        /*bInheritHandles=*/pcon == nullptr ? TRUE : FALSE, flags, envblock.data(),
                        wcwd.empty() ? nullptr : wcwd.c_str(), &si.StartupInfo, &pi) == 0) {
@@ -348,8 +383,10 @@ bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
   }
 
   if (::AssignProcessToJobObject(job, pi.hProcess) == 0) {
-    // 进不了 Job 就不放行 —— 与「装不上沙箱就不执行」是同一条原则：
-    // 没有 Job 就没有进程树所有权，一个 `start /b` 就能把后台进程留在系统里。
+    // If it cannot join the Job, do not let it run -- the same principle as
+    // "if the sandbox cannot be applied, do not execute": no Job means no
+    // ownership of the process tree, and a single `start /b` leaves a
+    // background process behind on the system.
     *error = win::LastError("AssignProcessToJobObject");
     ::TerminateProcess(pi.hProcess, 126);
     ::CloseHandle(pi.hThread);
@@ -375,8 +412,10 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
     r.error = "empty argv";
     return r;
   }
-  // 沙箱装不上就不执行。这条不变式两个平台完全一致。
-  // （conf 为空只在 danger-full-access 下合法，调用方已经判过。）
+  // If the sandbox cannot be applied, do not execute. This invariant is
+  // identical on both platforms.
+  // (A null conf is only legal under danger-full-access, and the caller has
+  //  already checked that.)
 
   io::Fd in_fd = io::kInvalid, out_fd = io::kInvalid, err_fd = io::kInvalid;
   HANDLE child_in = INVALID_HANDLE_VALUE, child_out = INVALID_HANDLE_VALUE,
@@ -403,8 +442,9 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
     return r;
   }
 
-  // 子进程那三端交出去了，父进程立刻关掉自己手里的副本 ——
-  // 不关的话子进程退出后管道永远不会 EOF，cell 就永远不会 done。
+  // The child's three ends have been handed over, so the parent closes its own
+  // copies immediately -- leave them open and the pipes never reach EOF after
+  // the child exits, so the cell is never done.
   ::CloseHandle(child_in);
   ::CloseHandle(child_out);
   ::CloseHandle(child_err);
@@ -420,14 +460,15 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
                           const std::vector<std::string>& envp, const Confinement* conf,
                           const SeccompPlan& seccomp, const Limits& limits) {
   SpawnResult r;
-  (void)seccomp;  // Windows 上没有这一层，见 sandbox/seccomp.hpp 的说明
+  (void)seccomp;  // no such layer on Windows; see the notes in sandbox/seccomp.hpp
   if (argv.empty()) {
     r.error = "empty argv";
     return r;
   }
 
   Proc proc;
-  // 前台跑：直接继承 hxd 自己的 stdio，逃逸测试要看到的是真实输出
+  // Foreground run: inherit hxd's own stdio directly, because the escape tests
+  // need to see the real output
   if (!win_spawn::Launch(argv, cwd, envp, conf, limits, ::GetStdHandle(STD_INPUT_HANDLE),
                          ::GetStdHandle(STD_OUTPUT_HANDLE), ::GetStdHandle(STD_ERROR_HANDLE),
                          nullptr, &proc, &r.error)) {

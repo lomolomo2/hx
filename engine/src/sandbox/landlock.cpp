@@ -44,19 +44,22 @@ uint64_t WriteAccessForAbi(int abi) {
                LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
                LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO |
                LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM;
-  if (abi >= 2) w |= LANDLOCK_ACCESS_FS_REFER;    // 跨目录 rename/link，apply_patch 需要
+  if (abi >= 2) w |= LANDLOCK_ACCESS_FS_REFER;    // cross-directory rename/link, which apply_patch needs
   if (abi >= 3) w |= LANDLOCK_ACCESS_FS_TRUNCATE;
   return w;
 }
 
-// 非目录只能被授予"文件类"权限。把目录专用位（MAKE_*/READ_DIR/REMOVE_*/REFER）
-// 用在普通文件或设备节点上，内核直接返回 EINVAL —— /dev/null 授权失败就是这么来的。
+// Non-directories can only be granted "file-class" permissions. Use a
+// directory-only bit (MAKE_*/READ_DIR/REMOVE_*/REFER) on a regular file or a
+// device node and the kernel returns EINVAL outright -- which is exactly how
+// granting /dev/null came to fail.
 constexpr uint64_t kFileApplicableAccess = LANDLOCK_ACCESS_FS_EXECUTE |
                                            LANDLOCK_ACCESS_FS_WRITE_FILE |
                                            LANDLOCK_ACCESS_FS_READ_FILE |
                                            LANDLOCK_ACCESS_FS_TRUNCATE;
 
-// 给路径授权。路径不存在只记警告，不算失败——不同发行版路径差异很大。
+// Grant access to a path. A non-existent path is only a warning, not a
+// failure -- paths vary a great deal between distributions.
 bool GrantPath(int ruleset_fd, const std::string& path, uint64_t access,
                std::vector<std::string>* warnings) {
   const int pfd = ::open(path.c_str(), O_PATH | O_CLOEXEC);
@@ -72,7 +75,7 @@ bool GrantPath(int ruleset_fd, const std::string& path, uint64_t access,
     access &= kFileApplicableAccess;
     if (access == 0) {
       ::close(pfd);
-      return true;  // 该文件在本策略下无可授予的权限，属正常情况
+      return true;  // no grantable permission for this file under this policy; normal
     }
   }
 
@@ -131,17 +134,19 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
   out.conf = std::make_shared<Confinement>();
   out.conf->fd = static_cast<int>(fd);
 
-  // 只读：系统路径 + roots 都只给读
-  // 可写：系统路径给读，roots / tmpdir / 设备节点给读写
+  // read-only: system paths and roots alike get read only
+  // writable:  system paths get read; roots / tmpdir / device nodes get read+write
   const uint64_t write_access = kReadAccess | WriteAccessForAbi(abi);
 
   for (const auto& path : DefaultSystemReadPaths()) {
     GrantPath(out.conf->fd, path, kReadAccess, &out.warnings);
   }
 
-  // 设备节点在任何模式下都要可写：写 /dev/null 是空操作，不是安全边界。
-  // 少了它，read-only 会话里每条 shell 命令都会被 profile 脚本的
-  // "/dev/null: Permission denied" 噪音污染 —— 白烧 token，还会误导模型。
+  // Device nodes must be writable in every mode: writing to /dev/null is a
+  // no-op, not a security boundary. Without it, every shell command in a
+  // read-only session gets polluted by "/dev/null: Permission denied" noise
+  // from profile scripts -- burning tokens for nothing and misleading the
+  // model besides.
   for (const auto& dev : DefaultWritableDevices()) {
     GrantPath(out.conf->fd, dev, write_access, &out.warnings);
   }
@@ -169,10 +174,10 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
 }
 
 bool ApplyRestrictSelf(const Confinement* conf, std::string* err) {
-  if (conf == nullptr || conf->fd < 0) return true;  // 明确不施加
+  if (conf == nullptr || conf->fd < 0) return true;  // explicitly not applied
   const int ruleset_fd = conf->fd;
 
-  // landlock_restrict_self 要求进程已设置 no_new_privs
+  // landlock_restrict_self requires the process to have set no_new_privs
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     *err = std::string("prctl(PR_SET_NO_NEW_PRIVS): ") + ::strerror(errno);
     return false;

@@ -1,4 +1,5 @@
-// 按行切分 stdin。超长行整行丢弃并报错，但不断开连接（proto/hxp-v0.md §0）。
+// Split stdin into lines. An over-long line is discarded whole and reported as
+// an error, but the connection is not dropped (proto/hxp-v0.md section 0).
 #pragma once
 
 #include <functional>
@@ -23,7 +24,7 @@ class LineReader {
       chunk.remove_prefix(nl + 1);
 
       if (discarding_) {
-        discarding_ = false;  // 超长行的行尾到了，恢复正常
+        discarding_ = false;  // the over-long line's terminator arrived; resume normally
         buf_.clear();
         continue;
       }

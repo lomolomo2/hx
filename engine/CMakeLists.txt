@@ -10,12 +10,15 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-# 平台无关的部分。
+# The platform-independent part.
 #
-# ★ 划分原则：这里只放「决定做什么」的代码。
-#   凡是要问操作系统「怎么做」的，都在下面按平台挑 —— 而且是整个文件挑，
-#   不是在文件里撒 #ifdef。散落的 #ifdef 会让两条路径互相看不见，
-#   改一边忘一边；整文件切分至少保证两边的函数签名必须对得上，编译器会盯着。
+# ★ The dividing principle: only code that decides *what to do* lives here.
+#   Anything that has to ask the operating system *how* is selected by platform
+#   below -- and selected a whole file at a time, not by scattering #ifdefs
+#   inside files. Scattered #ifdefs let the two paths drift out of sight of
+#   each other, so one gets changed and the other forgotten; splitting by file
+#   at least forces the signatures on both sides to line up, with the compiler
+#   watching.
 set(HX_COMMON_SOURCES
   src/main.cpp
   src/proto.cpp
@@ -64,36 +67,38 @@ endif()
 add_executable(hxd ${HX_COMMON_SOURCES} ${HX_PLATFORM_SOURCES})
 
 target_include_directories(hxd PRIVATE src)
-# vendor 用 SYSTEM，第三方头文件的告警不参与 -Werror
+# vendor is SYSTEM so third-party header warnings do not feed into -Werror
 target_include_directories(hxd SYSTEM PRIVATE vendor)
 
 if(WIN32)
   target_link_libraries(hxd PRIVATE
     userenv    # CreateAppContainerProfile / DeriveAppContainerSid
     advapi32   # SetEntriesInAcl / SetNamedSecurityInfo / CreateWellKnownSid
-    kernel32   # Job 对象、ConPTY、IOCP
+    kernel32   # Job objects, ConPTY, IOCP
   )
   target_compile_definitions(hxd PRIVATE
-    # Win10 起的 API：AppContainer 属性、ConPTY
+    # APIs from Win10 on: the AppContainer attribute, ConPTY
     _WIN32_WINNT=0x0A00
     WINVER=0x0A00
-    NOMINMAX               # windows.h 的 min/max 宏会和 std:: 打架
-    WIN32_LEAN_AND_MEAN    # 少拖进来一堆 winsock1 之类的老东西
-    UNICODE _UNICODE       # 只用 W 系列 API，见 platform/win_util.hpp
+    NOMINMAX               # windows.h's min/max macros fight with std::
+    WIN32_LEAN_AND_MEAN    # drags in less legacy baggage such as winsock1
+    UNICODE _UNICODE       # W APIs only; see platform/win_util.hpp
     _CRT_SECURE_NO_WARNINGS
   )
   if(MSVC)
     target_compile_options(hxd PRIVATE
       /W4 /WX
-      /utf-8               # 源码是 UTF-8；不给这个 MSVC 会按本地代码页读注释
-      /Zc:__cplusplus      # 否则 __cplusplus 永远报 199711
+      /utf-8               # the sources are UTF-8; without this MSVC reads them in the local code page
+      /Zc:__cplusplus      # otherwise __cplusplus always reports 199711
       /permissive-
       /EHsc
-      # C4100: 未使用的形参 —— seam 两侧签名必须一致，某一边用不上是正常的
+      # C4100: unused parameter -- both sides of a seam must share a signature,
+      # so one side not using a parameter is normal
       /wd4100
     )
   endif()
-  # tsx / node 起引擎时不该弹控制台窗口，但 hxd 本身是控制台程序（要 stdio）
+  # Starting the engine from tsx / node should pop up no console window, but
+  # hxd is itself a console program (it needs stdio)
   set_target_properties(hxd PROPERTIES WIN32_EXECUTABLE FALSE)
 else()
   target_link_libraries(hxd PRIVATE util)  # forkpty

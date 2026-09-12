@@ -1,4 +1,4 @@
-// hx serve —— 把 harness 暴露成 HTTP + SSE。
+// hx serve -- expose the harness over HTTP + SSE.
 //   HX_BASE_URL=... HX_MODEL=... npx tsx src/server/main.ts --port 4100
 import { serve } from "@hono/node-server";
 

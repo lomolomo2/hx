@@ -34,7 +34,8 @@ bool ParseSignal(const std::string& name, Sig* out) {
 
 bool GroupAlive(const Proc& p) {
   if (!p.valid()) return false;
-  // 子进程 setsid 过，所以 pgid == pid。负号打的是整个组。
+  // The child called setsid, so pgid == pid. The negative sign targets the
+  // whole group.
   return ::kill(-static_cast<pid_t>(p.pid), 0) == 0;
 }
 
@@ -60,18 +61,22 @@ bool SignalGroup(const Proc& p, Sig s) {
 void FreezeAndKillGroup(const Proc& p) {
   if (!p.valid()) return;
   const pid_t pgid = static_cast<pid_t>(p.pid);
-  // 先冻住：停住的进程 fork 不动，SIGKILL 才不用和繁殖速度赛跑。
+  // Freeze first: a stopped process cannot fork, so SIGKILL is not racing its
+  // breeding rate.
   ::kill(-pgid, SIGSTOP);
   ::kill(-pgid, SIGKILL);
-  // ★ 绝不能在这里 SIGCONT。
-  //   SIGKILL 对停住的进程照样生效，所以没必要解冻；而一旦解冻，
-  //   这一轮没杀到的幸存者就会重新开始繁殖 —— 实测正是这一行让
-  //   fork 炸弹永远清不干净。漏网的留在 stopped 状态，下一轮扫掉。
+  // ★ Never SIGCONT here.
+  //   SIGKILL still takes effect on a stopped process, so thawing is
+  //   unnecessary; and the moment you thaw, survivors this round missed start
+  //   breeding again -- measured, that one line is what made a fork bomb
+  //   impossible to clean up. Anything missed stays stopped and is swept next
+  //   round.
 }
 
 bool DupGroupForSweep(const Proc& p, Proc* out) {
   if (!p.valid()) return false;
-  // pgid 只是个整数，没有所有权可言 —— 复制它就够了。
+  // A pgid is just an integer with no ownership attached -- copying it is
+  // enough.
   out->pid = p.pid;
   return true;
 }

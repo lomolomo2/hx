@@ -1,8 +1,9 @@
-// Cell —— 一个受沙箱约束的子进程。
+// Cell -- one sandboxed child process.
 //
-// "cell" 是协议里的不透明 ID：真实 pid 从不出现在协议中（HANDLE 模型，
-// 见 harness-windows-kernel-analogy.md §2.3）。这样将来把实现换成容器
-// 或远程机器，宿主和模型侧都不用改。
+// "cell" is an opaque ID in the protocol: a real pid never appears there (the
+// HANDLE model; see harness-windows-kernel-analogy.md section 2.3). That way,
+// swapping the implementation for a container or a remote machine later
+// requires no change on the host or model side.
 #pragma once
 
 #include <cstdint>
@@ -16,32 +17,35 @@
 
 namespace hx {
 
-// 单个 cell 的输出上限；超出部分丢弃并计数（截断是第一天就要有的东西）
+// Output cap for a single cell; anything beyond it is dropped and counted
+// (truncation is a day-one requirement, not a later addition)
 inline constexpr size_t kCellBufferCap = 4u * 1024u * 1024u;
 
 struct Cell {
   std::string id;
   Proc proc;
-  io::Fd out_fd = io::kInvalid;  // 子进程 stdout 的读端
-  io::Fd err_fd = io::kInvalid;  // 子进程 stderr 的读端
+  io::Fd out_fd = io::kInvalid;  // read end of the child's stdout
+  io::Fd err_fd = io::kInvalid;  // read end of the child's stderr
 
-  std::string buf;        // 尚未被 exec.wait 取走的输出
-  size_t dropped = 0;     // 因超上限被丢弃的字节数
-  bool is_pty = false;           // pty 的输出不分 stdout/stderr
-  io::Fd in_fd = io::kInvalid;   // stdin 写端。
-                                 // ★ 别假设 pty 时 in_fd == out_fd：Linux 的 pty 主端
-                                 //   确实是同一个 fd，ConPTY 却是**两条独立管道**。
-                                 //   关流时必须分别处理，见 Engine::CloseCellFd。
+  std::string buf;        // output exec.wait has not collected yet
+  size_t dropped = 0;     // bytes dropped for exceeding the cap
+  bool is_pty = false;           // pty output does not separate stdout/stderr
+  io::Fd in_fd = io::kInvalid;   // stdin write end.
+                                 // ★ Do not assume in_fd == out_fd for a pty: on Linux
+                                 //   the pty master really is the same fd, but ConPTY
+                                 //   uses **two independent pipes**. They must be closed
+                                 //   separately; see Engine::CloseCellFd.
   bool exited = false;
   int exit_code = -1;
   int term_signal = 0;
-  int64_t kill_deadline_ms = 0;  // 0 = 无超时
+  int64_t kill_deadline_ms = 0;  // 0 = no timeout
   bool killed_by_timeout = false;
 
-  // ---- 收尾用的两个状态（都是被 fork 炸弹逼出来的）----
+  // ---- Two pieces of teardown state (both forced on us by fork bombs) ----
   //
-  // 直接子进程已退出、但管道 fd 仍被孙进程持有时，EOF 永远不会来。
-  // 给一小段时间把缓冲读干净，然后强制收口，否则这个 cell 永远不会 done。
+  // When the direct child has exited but the pipe fds are still held by
+  // grandchildren, EOF never arrives. Allow a short window to drain the
+  // buffer, then force closure, or this cell is never done.
   int64_t fd_close_deadline_ms = 0;
 
   bool Finished() const {
@@ -50,9 +54,10 @@ struct Cell {
   void Append(const char* data, size_t len);
 
   /**
-   * ★ cell 被 exec.wait 回收时，内核对象必须一起还回去。
-   *   Windows 上尤其要紧：Job 句柄漏一个，KILL_ON_JOB_CLOSE 就永远不触发，
-   *   那棵子树会一直活到 hxd 退出为止 —— 正是「进程组即所有权」要防的事。
+   * ★ When exec.wait reaps a cell, the kernel objects must go back with it.
+   *   This matters most on Windows: leak one Job handle and
+   *   KILL_ON_JOB_CLOSE never fires, so that subtree lives until hxd exits --
+   *   exactly what "the process group is ownership" exists to prevent.
    */
   ~Cell();
   Cell() = default;

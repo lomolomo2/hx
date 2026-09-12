@@ -1,13 +1,15 @@
-// 平台原语。
+// Platform primitives.
 //
-// 这一层存在的唯一理由：engine.cpp / rollout.cpp / path_guard.cpp 里那些
-// 「本来就与操作系统无关」的逻辑，不该因为 realpath / mkdir / clock_gettime
-// 这种小东西被钉死在 POSIX 上。
+// The only reason this layer exists: the logic in engine.cpp / rollout.cpp /
+// path_guard.cpp that is inherently OS-independent should not be nailed to
+// POSIX by small things like realpath / mkdir / clock_gettime.
 //
-// ★ 边界要划得准：真正带语义的东西（沙箱、进程组、pty）不在这里，
-//   它们各自有自己的 seam（sandbox/confine.hpp、exec/proc.hpp、exec/pty.hpp）。
-//   这里只放「两边都有、只是拼写不同」的调用。混进语义就会变成
-//   一个什么都往里塞的 util.h。
+// ★ Draw the boundary precisely: anything carrying real semantics (sandbox,
+//   process groups, pty) does NOT belong here -- each of those has its own
+//   seam (sandbox/confine.hpp, exec/proc.hpp, exec/pty.hpp). This file holds
+//   only calls that exist on both sides and merely spell differently. Let
+//   semantics in and it degenerates into a util.h that everything gets
+//   dumped into.
 #pragma once
 
 #include <cstdint>
@@ -17,13 +19,16 @@
 
 namespace hx::platform {
 
-/** 单调时钟毫秒。用于所有 deadline —— 绝不能用挂钟，改时间会让超时错乱。 */
+/** Monotonic clock, milliseconds. Every deadline uses it -- never the wall
+ *  clock, or changing the system time throws off all timeouts. */
 int64_t NowMs();
 
-/** 本进程 pid（只用于日志与 ping，协议里从不出现真实 pid）。 */
+/** This process's pid (logging and ping only; a real pid never appears in the
+ *  protocol). */
 int64_t Pid();
 
-/** 解析为规范化的绝对路径；不存在返回 false。POSIX realpath / Win GetFinalPathNameByHandle。 */
+/** Resolve to a canonical absolute path; false if it does not exist.
+ *  POSIX realpath / Windows GetFinalPathNameByHandle. */
 bool RealPath(const std::string& in, std::string* out);
 
 bool IsDirectory(const std::string& p);
@@ -34,57 +39,69 @@ struct StatInfo {
   bool is_dir = false;
   bool is_regular = false;
   int64_t size = 0;
-  int mode = 0;  // POSIX 权限位；Windows 上是合成值（只读 = 0444）
+  int mode = 0;  // POSIX permission bits; a synthesized value on Windows
+                 // (read-only = 0444)
   int64_t mtime_ms = 0;
 };
 bool Stat(const std::string& p, StatInfo* out);
 
-/** 递归建目录，权限 0700（Windows 上靠继承 ACL，语义见实现注释）。 */
+/** Create a directory tree with mode 0700 (on Windows this relies on
+ *  inherited ACLs; see the implementation comment for the semantics). */
 bool MakeDirs(const std::string& path, std::string* err);
 
-/** 建一个只有本用户可进的临时目录。prefix 只是可读性前缀。 */
+/** Create a temporary directory only this user can enter. `prefix` is just a
+ *  readability prefix. */
 bool MakeTempDir(const std::string& prefix, std::string* out, std::string* err);
 
-/** 删空目录。非空时失败 —— 故意的，留有痕迹便于排查。 */
+/** Remove an empty directory. Fails when non-empty -- deliberately, so
+ *  leftovers stay visible for diagnosis. */
 bool RemoveDir(const std::string& path);
 
-/** 用户主目录。rollout 默认落在这下面。 */
+/** The user's home directory. Rollouts land under it by default. */
 std::string HomeDir();
 
 bool GetEnv(const char* name, std::string* out);
 
-/** 目录项枚举。失败返回 false（调用方一律跳过，glob 不因一个不可读目录而整个失败）。 */
+/** Enumerate directory entries. Returns false on failure (callers always skip
+ *  it -- one unreadable directory must not fail an entire glob). */
 bool ListDir(const std::string& dir, std::vector<std::string>* names);
 
-/** 单个路径分量的通配匹配（POSIX fnmatch(FNM_PATHNAME) 的等价物）。 */
+/** Glob match for a single path component (the equivalent of POSIX
+ *  fnmatch(FNM_PATHNAME)). */
 bool MatchComponent(const std::string& pattern, const std::string& name);
 
-// ---- 文件 ----
+// ---- Files ----
 
-/** 读整个文件。 */
+/** Read an entire file. */
 bool ReadWholeFile(const std::string& path, std::string* out, std::string* err);
 
 /**
- * 原子替换：同目录临时文件 -> 落盘 -> rename。
- * 崩在中途要么是旧内容要么是新内容，不会出现半个文件。
+ * Atomic replace: temp file in the same directory -> flush -> rename.
+ * A crash partway through leaves either the old content or the new one,
+ * never half a file.
  */
 bool WriteFileAtomic(const std::string& path, const std::string& content, std::string* err);
 
 bool Unlink(const std::string& path);
 
-/** 按 UTF-8 路径打开 FILE*（Windows 上走宽字符，否则中文路径会静默打不开）。 */
+/** Open a FILE* by UTF-8 path (wide characters on Windows, or non-ASCII paths
+ *  silently fail to open). */
 std::FILE* FopenUtf8(const std::string& path, const char* mode);
 
 /**
- * append-only 句柄。rollout 的持久性承诺全压在它身上：
- *   · 每条记录一次写 -> 进程被强杀也不会留下半行
- *   · 掉电级持久性靠 Sync()
+ * Append-only handle. The rollout's durability promise rests entirely on it:
+ *   - one write() per record -> a hard kill never leaves half a line
+ *   - power-loss durability comes from Sync()
  *
- * ★ 两个平台的"原子追加"来路不同，但保证一样：
- *     POSIX   O_APPEND：偏移与写在内核里是一次操作
- *     Windows FILE_APPEND_DATA 且不带 FILE_WRITE_DATA：同样由内核保证
- *   都只对「不超过管道/扇区缓冲的单次写」成立，所以短写必须当失败上报，
- *   不能假装成功 —— 日志是这个系统的事实来源，宁可报错也不能留半行。
+ * ★ The two platforms reach "atomic append" by different routes, but the
+ *   guarantee is the same:
+ *     POSIX   O_APPEND: seek and write are a single operation in the kernel
+ *     Windows FILE_APPEND_DATA without FILE_WRITE_DATA: likewise guaranteed
+ *                                                       by the kernel
+ *   Both hold only for a single write that fits the pipe/sector buffer, so a
+ *   short write must be reported as a failure rather than papered over -- the
+ *   log is this system's source of truth; better to error than to leave half
+ *   a line.
  */
 class AppendFile {
  public:
@@ -100,43 +117,48 @@ class AppendFile {
   bool valid() const { return h_ != -1; }
 
  private:
-  std::intptr_t h_ = -1;  // POSIX: fd。Windows: HANDLE
+  std::intptr_t h_ = -1;  // POSIX: fd. Windows: HANDLE
 };
 
-/** 本地日期，形如 "2026/09/11"（rollout 的目录结构）。 */
+/** Local date, shaped like "2026/09/11" (the rollout directory layout). */
 std::string LocalDatePath();
 
-/** 挂钟毫秒（记录时间戳用；deadline 一律用 NowMs）。 */
+/** Wall-clock milliseconds (for recorded timestamps; deadlines always use
+ *  NowMs). */
 int64_t UnixNowMs();
 
-// ---- 路径形状 ----
+// ---- Path shape ----
 //
-// ★ Windows 的路径不是「/ 分隔的字符串」：有盘符、有 UNC、大小写不敏感。
-//   path_guard 是整个系统里唯一把字符串变成路径的地方，它必须能问清楚
-//   这些问题，否则 roots 包含判断在 Windows 上就是错的。
+// ★ A Windows path is not "a string separated by /": it has drive letters,
+//   UNC forms, and is case-insensitive. path_guard is the single place in the
+//   system that turns a string into a path, and it has to be able to ask
+//   these questions -- otherwise root containment checks are simply wrong on
+//   Windows.
 
-/** 首选分隔符（'/' 或 '\'）。 */
+/** The preferred separator ('/' or '\'). */
 char PreferredSeparator();
 
-/** 是否是分隔符（Windows 上 '/' 与 '\' 都算）。 */
+/** Is this a separator? (On Windows both '/' and '\' count.) */
 bool IsSeparator(char c);
 
-/** 绝对路径？Windows: "C:\x" 或 "\\server\share"；POSIX: 以 '/' 开头。 */
+/** Absolute path? Windows: "C:\x" or "\\server\share"; POSIX: starts with '/'. */
 bool IsAbsolute(const std::string& p);
 
-/** 把 rel 接到 base 后面（rel 为绝对路径时直接返回 rel）。 */
+/** Append `rel` to `base` (returns `rel` unchanged when it is absolute). */
 std::string Join(const std::string& base, const std::string& rel);
 
-/** 规范化分隔符：Windows 上统一成 '\'，POSIX 上不变。 */
+/** Normalize separators: all '\' on Windows, unchanged on POSIX. */
 std::string Normalize(const std::string& p);
 
-/** 取父目录。没有父目录时返回根。 */
+/** The parent directory. Returns the root when there is no parent. */
 std::string Parent(const std::string& p);
 
-/** 路径相等/前缀比较用的折叠形式（Windows 大小写不敏感 → 转小写）。 */
+/** The folded form used for path equality and prefix comparison (Windows is
+ *  case-insensitive -> lowercased). */
 std::string FoldCase(const std::string& p);
 
-/** path 是否等于 root 或在 root 之下。两边都必须是已规范化的绝对路径。 */
+/** Is `path` equal to `root` or below it? Both must already be normalized
+ *  absolute paths. */
 bool IsWithin(const std::string& path, const std::string& root);
 
 }  // namespace hx::platform

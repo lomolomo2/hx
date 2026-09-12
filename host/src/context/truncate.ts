@@ -1,7 +1,9 @@
-// 中段截断：保住头和尾，砍中间。
+// Middle truncation: keep the head and the tail, cut the middle.
 //
-// 命令输出里最有信息量的是开头（跑了什么、前几条错误）和结尾（最终状态、
-// 测试结论、堆栈）。只留头会丢掉结论，只留尾会丢掉上下文。
+// The most informative parts of command output are the beginning (what ran,
+// the first few errors) and the end (the final state, the test verdict, the
+// stack trace). Keeping only the head loses the conclusion; keeping only the
+// tail loses the context.
 export function truncateMiddle(text: string, headChars: number, tailChars: number): string {
   if (text.length <= headChars + tailChars) return text;
   const head = text.slice(0, headChars);

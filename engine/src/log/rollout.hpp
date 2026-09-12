@@ -1,12 +1,14 @@
-// rollout —— append-only 的会话日志，是这个系统里的"事实来源"。
+// rollout -- the append-only session log, and this system's source of truth.
 //
-// ★ 路径由引擎决定，宿主只能给一个受校验的会话名。
-//   否则宿主就能用 log.append 往任意文件追加内容（例如 shell 的 rc 文件），
-//   等于在架构上开了个后门 —— 引擎唯一能写的地方必须是它自己划定的。
+// ★ The engine decides the path; the host may only supply a validated session
+//   name. Otherwise the host could use log.append to append to any file at all
+//   (a shell's rc file, say), which would be an architectural back door -- the
+//   only place the engine writes must be one it chose itself.
 //
-// 持久性承诺（要说准，不能含糊）：
-//   · 每条记录用一次 write() 追加（O_APPEND），因此进程被 kill -9 也不会留下半行
-//   · 掉电级别的持久性需要 fsync，只在 Flush() 时做
+// The durability promise (stated precisely, not vaguely):
+//   - each record is appended with one write() (O_APPEND), so even a process
+//     killed with -9 leaves no half line
+//   - power-loss durability requires fsync, which happens only in Flush()
 #pragma once
 
 #include "platform/platform.hpp"
@@ -22,9 +24,9 @@ class Rollout {
  public:
   ~Rollout();
 
-  // base 为空时用 $HOME/.hx/sessions。name 必须是 [A-Za-z0-9_-]{1,64}。
+  // An empty base means $HOME/.hx/sessions. name must be [A-Za-z0-9_-]{1,64}.
   bool Open(const std::string& base, const std::string& name, std::string* err);
-  // 返回本条记录的序号；未打开时返回 -1
+  // Returns this record's sequence number; -1 when not open
   int64_t Append(const json& record);
   bool Flush();
   void Close();

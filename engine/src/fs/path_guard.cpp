@@ -9,8 +9,10 @@
 namespace hx {
 namespace {
 
-// 拆出父目录与最后一段。分隔符判断走 platform —— Windows 上 '/' 和 '\\' 都算，
-// 只认一种的话 "dir/file" 这种宿主传来的路径会被当成单个文件名。
+// Split off the parent directory and the final component. The separator test
+// goes through platform -- on Windows both '/' and '\\' count, and recognizing
+// only one would treat a host-supplied path like "dir/file" as a single
+// filename.
 void SplitLast(const std::string& p, std::string* parent, std::string* leaf) {
   size_t slash = std::string::npos;
   for (size_t i = p.size(); i > 0; --i) {
@@ -31,10 +33,11 @@ void SplitLast(const std::string& p, std::string* parent, std::string* leaf) {
 }  // namespace
 
 bool IsWithin(const std::string& path, const std::string& root) {
-  // ★ 委托给 platform，因为「在不在 root 之下」在两个平台上不是同一个问题：
-  //   POSIX 按字节比较即可；Windows 的 NTFS 默认大小写不敏感，
-  //   "C:\Repo" 与 "c:\repo" 是同一个目录，按字节比会判成两个不同的 root ——
-  //   逃逸就从这个缝里进来。
+  // ★ Delegated to platform, because "is it under the root" is not the same
+  //   question on the two platforms: POSIX can simply compare bytes, while
+  //   NTFS is case-insensitive by default, so "C:\Repo" and "c:\repo" are the
+  //   same directory and a byte comparison would judge them two different
+  //   roots -- and that gap is exactly where an escape gets in.
   return platform::IsWithin(path, root);
 }
 
@@ -50,14 +53,15 @@ ResolveResult ResolveInRoots(const std::string& input, const std::string& base,
 
   std::string resolved;
   if (platform::RealPath(joined, &resolved)) {
-    // 解析成功：符号链接 / junction / 8.3 短名都已经被解开
+    // Resolved: symlinks / junctions / 8.3 short names have all been unwound
   } else {
     if (must_exist) {
       r.error = "cannot resolve: " + joined;
       return r;
     }
-    // 允许最后一段不存在：解析父目录，再拼回来。
-    // 这样父目录上的符号链接同样会被解开，逃逸不了。
+    // The final component is allowed not to exist: resolve the parent
+    // directory and rejoin. That way symlinks on the parent are unwound too
+    // and nothing escapes.
     std::string parent;
     std::string leaf;
     SplitLast(joined, &parent, &leaf);

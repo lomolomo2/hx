@@ -1,7 +1,9 @@
-// hxd —— hx 引擎。JSONL over stdio，见 proto/hxp-v0.md
+// hxd -- the hx engine. JSONL over stdio; see proto/hxp-v0.md
 //
-// 这个进程是整个系统里唯一被允许碰真实世界的地方：起进程、读写文件、装沙箱。
-// TS 宿主没有 fs / child_process，一切副作用都要从这里过。
+// This process is the only place in the whole system allowed to touch the real
+// world: starting processes, reading and writing files, applying the sandbox.
+// The TypeScript host has no fs / child_process, so every side effect passes
+// through here.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,10 +25,12 @@
 namespace hx {
 namespace {
 
-// 输出与事件循环都在 engine.cpp；这里只留 CLI 入口与 --sandbox-exec。
+// Output and the event loop both live in engine.cpp; all that remains here is
+// the CLI entry point and --sandbox-exec.
 //
-// ★ 这两条路径都在 io::InitStdio 之前跑，所以用 stdio 而不是 io:: ——
-//   它们是一次性的同步输出，不需要事件循环那套非阻塞机制。
+// ★ Both of those paths run before io::InitStdio, so they use stdio rather
+//   than io:: -- they are one-shot synchronous output and need none of the
+//   event loop's non-blocking machinery.
 bool WriteLine(const json& j) {
   std::string s = j.dump();
   s.push_back('\n');
@@ -38,12 +42,14 @@ bool WriteLine(const json& j) {
 int PrintSelfTest() {
   const Caps c = DetectCaps();
   WriteLine(CapsToJson(c));
-  // 退出码携带最重要的那条结论：这台机器上到底有没有真沙箱。
+  // The exit code carries the single most important conclusion: whether this
+  // machine actually has a sandbox.
   return HasRealSandbox(c) ? 0 : 2;
 }
 
-// --sandbox-exec：在给定策略下前台跑一条命令。
-// 存在的意义是能在接协议之前，用真实命令验证沙箱内核（逃逸测试套件用它）。
+// --sandbox-exec: run one command in the foreground under a given policy.
+// It exists so the sandbox kernel can be verified with real commands before
+// any protocol is involved (the escape test suite uses it).
 int SandboxExec(int argc, char** argv, int start) {
   Policy p;
   std::vector<std::string> cmd;
@@ -85,10 +91,11 @@ int SandboxExec(int argc, char** argv, int start) {
     return 64;
   }
 
-  // ★ 与 session.open 走同一条路：建会话私有 tmp 并授权。
-  //   README 的教训之一就是「测试路径必须等于生产路径」——
-  //   --sandbox-exec 少设一个 TMPDIR，就会让逃逸测试在一个真实会话里
-  //   根本不存在的环境下通过。这个坑在本项目里踩过三次。
+  // ★ Take the same path as session.open: create the session-private tmp and
+  //   grant it. One of the README's lessons is "the test path must equal the
+  //   production path" -- leave TMPDIR unset in --sandbox-exec and the escape
+  //   tests pass in an environment that does not exist in a real session at
+  //   all. This trap has been hit three times in this project.
   std::string tmperr;
   if (!platform::MakeTempDir("hx-exec-", &p.tmpdir, &tmperr)) {
     std::fprintf(stderr, "hxd: warning: no session tmpdir: %s\n", tmperr.c_str());

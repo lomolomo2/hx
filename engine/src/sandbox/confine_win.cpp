@@ -20,21 +20,24 @@
 namespace hx {
 namespace {
 
-// 都定义在下面；这里前置声明，免得为了调用顺序把定义挪来挪去。
+// Both are defined below; forward-declared here so definitions do not have to
+// be shuffled around to satisfy call order.
 void RemoveOrphanAppContainerAces(const std::wstring& path);
 PSID MakeCapabilitySid(WELL_KNOWN_SID_TYPE type);
 
 /**
- * 在一个路径上给 SID 加一条可继承的 ACE。
+ * Add one inheritable ACE for a SID on a path.
  *
- * ★ 用 GRANT_ACCESS + SetEntriesInAcl（而不是自己拼 ACL）的原因：
- *   它会把新 ACE 放在**已有 deny ACE 之后、allow ACE 之前**的正确位置。
- *   手拼顺序错了，一条本该生效的 deny 会被我们的 allow 抢先匹配掉 ——
- *   那是在给用户的目录开洞，而不是给沙箱授权。
+ * ★ Why GRANT_ACCESS + SetEntriesInAcl rather than assembling the ACL by
+ *   hand: it places the new ACE in the correct position -- **after existing
+ *   deny ACEs and before allow ACEs**. Get the order wrong by hand and a deny
+ *   that should have taken effect is pre-empted by our allow, which punches a
+ *   hole in the user's directory rather than granting the sandbox access.
  */
 bool GrantOnPath(const std::wstring& path, PSID sid, DWORD access,
                  std::vector<std::string>* warnings) {
-  // 先把上一次崩溃留下的孤儿 ACE 清掉，再加自己的 —— 否则它们会一层层堆积。
+  // Clear orphan ACEs left by a previous crash before adding our own --
+  // otherwise they pile up layer by layer.
   RemoveOrphanAppContainerAces(path);
 
   PACL old_dacl = nullptr;
@@ -50,7 +53,8 @@ bool GrantOnPath(const std::wstring& path, PSID sid, DWORD access,
   EXPLICIT_ACCESS_W ea{};
   ea.grfAccessPermissions = access;
   ea.grfAccessMode = GRANT_ACCESS;
-  // 目录上的 ACE 必须可继承，否则只有目录本身能访问，里面的文件一概拒绝。
+  // An ACE on a directory must be inheritable, or only the directory itself is
+  // accessible and every file inside is denied.
   ea.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
   ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
   ea.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
@@ -74,7 +78,8 @@ bool GrantOnPath(const std::wstring& path, PSID sid, DWORD access,
   return true;
 }
 
-/** 撤销 GrantOnPath 加的那条 ACE。析构时尽力而为，失败不报错。 */
+/** Revoke the ACE GrantOnPath added. Best-effort during destruction; failures
+ *  are not reported. */
 void RevokeOnPath(const std::wstring& path, PSID sid) {
   PACL old_dacl = nullptr;
   PSECURITY_DESCRIPTOR sd = nullptr;
@@ -98,19 +103,23 @@ void RevokeOnPath(const std::wstring& path, PSID sid) {
 }
 
 /**
- * 清掉一个对象上**孤儿**的 AppContainer ACE。
+ * Clear **orphan** AppContainer ACEs from one object.
  *
- * ★ 为什么需要：正常退出时 ~Confinement 会把自己打的 ACE 撤掉，
- *   但 hxd 被 kill -9 时析构函数根本不会跑，ACE 就留在用户的目录上了。
- *   开发/崩溃循环里这东西会一层层堆积 —— 实测两轮实验就在 C:\、
- *   C:\Users\<user>、AppData\Local、工作区上各留下一条。
+ * ★ Why this is needed: on a clean exit ~Confinement revokes the ACEs it
+ *   added, but when hxd is killed with -9 the destructor never runs at all and
+ *   the ACEs stay behind in the user's directories. Across a development or
+ *   crash loop they pile up layer by layer -- measured, two rounds of
+ *   experiments left one each on C:\, C:\Users\<user>, AppData\Local and the
+ *   workspace.
  *
- * ★ 判据是 **SID 解析不出名字**：package profile 已经被删掉（SweepStaleProfiles
- *   会删，或者用户自己删了），SID 就成了无主的孤儿。还能解析出名字的
- *   属于真实安装的应用，一律不碰。
+ * ★ The test is that the **SID does not resolve to a name**: once the package
+ *   profile has been deleted (by SweepStaleProfiles, or by the user), the SID
+ *   is an ownerless orphan. Anything that still resolves to a name belongs to
+ *   a genuinely installed application and is never touched.
  *
- * ★ 只在**我们自己正要动的那几个对象**上做（roots / tmpdir / 卷根），
- *   不扫盘。范围越小越安全，也不会有性能问题。
+ * ★ Done only on **the handful of objects we are about to touch ourselves**
+ *   (roots / tmpdir / volume roots), never by scanning the disk. The narrower
+ *   the scope the safer, and there is no performance problem either.
  */
 void RemoveOrphanAppContainerAces(const std::wstring& path) {
   PACL dacl = nullptr;
@@ -132,20 +141,24 @@ void RemoveOrphanAppContainerAces(const std::wstring& path) {
     PSID s = reinterpret_cast<PSID>(&static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart);
     if (::IsValidSid(s) == 0) continue;
 
-    // 只看 package SID（S-1-15-2-...）
+    // Only consider package SIDs (S-1-15-2-...)
     SID_IDENTIFIER_AUTHORITY* auth = ::GetSidIdentifierAuthority(s);
     if (auth == nullptr || auth->Value[5] != 15) continue;
     const UCHAR count = *::GetSidSubAuthorityCount(s);
     if (count < 1 || *::GetSidSubAuthority(s, 0) != 2) continue;
 
-    // ★ 还要求「形状和我们自己打的一模一样」才动它。
+    // ★ Also require that **the shape matches exactly what we stamp** before
+    //   touching it.
     //
-    //   光看"SID 解析不出名字"是不够的：用户卸载过的某个应用也可能在这里
-    //   留下孤儿 ACE，那不是我们的东西，删了就是在动别人的数据。
-    //   我们打的 ACE 掩码和继承标志都是定死的（见 GrantOnPath）——
-    //   对不上就不是我们留下的，一律跳过。
-    //   kOurTraverse 那一支留着，是为了清掉早先"每会话给卷根打 ACE"
-    //   那个已经废弃的做法留下的残留。
+    //   "The SID does not resolve to a name" is not enough on its own: an
+    //   application the user once uninstalled can leave an orphan ACE here
+    //   too, and that is not ours -- deleting it would be touching someone
+    //   else's data. The mask and inheritance flags of the ACEs we stamp are
+    //   fixed (see GrantOnPath), so anything that does not match was not left
+    //   by us and is skipped.
+    //   The kOurTraverse branch is kept in order to clean up residue from the
+    //   now-abandoned approach of stamping an ACE on the volume root per
+    //   session.
     const ACCESS_MASK mask = static_cast<ACCESS_ALLOWED_ACE*>(ace)->Mask;
     const BYTE inherit = static_cast<BYTE>(hdr->AceFlags &
                                            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE));
@@ -159,7 +172,7 @@ void RemoveOrphanAppContainerAces(const std::wstring& path) {
         (inherit == 0 && mask == kOurTraverse);
     if (!ours) continue;
 
-    // 解析得出名字 = package 还在 = 有主，别动
+    // Resolves to a name = the package still exists = it has an owner; leave it
     wchar_t name[256]{}, domain[256]{};
     DWORD nlen = 256, dlen = 256;
     SID_NAME_USE use{};
@@ -189,7 +202,8 @@ void RemoveOrphanAppContainerAces(const std::wstring& path) {
 }
 
 /**
- * 取一个路径所在的卷根（"C:\" / "\\\\server\\share\\"）。取不到返回空。
+ * The volume root a path lives on ("C:\" / "\\\\server\\share\\"). Empty when
+ * it cannot be determined.
  */
 std::wstring VolumeRootOf(const std::wstring& path) {
   wchar_t buf[MAX_PATH]{};
@@ -198,26 +212,34 @@ std::wstring VolumeRootOf(const std::wstring& path) {
 }
 
 /**
- * 卷根**只检查、不修改**，缺了就如实告诉用户该跑哪条命令。
+ * Volume roots are **checked, never modified**; if the grant is missing, tell
+ * the user honestly which command to run.
  *
- * ★ 为什么不像 roots 那样直接打 ACE —— 这是两次踩坑之后定下来的边界。
+ * ★ Why not just stamp an ACE the way roots do -- a boundary settled after
+ *   being burned twice.
  *
- *   ① 逐级爬父链：灾难。SetNamedSecurityInfoW 作用在一个目录上会
- *      **向整个子树重算继承**，在 C:\Users\<user> 上调它等于遍历整个
- *      用户 profile，实测十分钟没回来，中途被杀还会在用户目录上留 ACE。
+ *   1. Walking up the ancestor chain: a disaster. SetNamedSecurityInfoW
+ *      applied to a directory **recomputes inheritance across the entire
+ *      subtree**, so calling it on C:\Users\<user> means traversing the whole
+ *      user profile. Measured: ten minutes without returning, and killing it
+ *      partway leaves ACEs behind in the user's directory.
  *
- *   ② 退一步只写卷根：还是不行。实测 `icacls C:\ /grant ...` 单次就要
- *      **16 秒**（C:\ 的子项也要参与传播）。而会话开始要 grant、结束要
- *      revoke，于是**每个 session.open 平白多出 30 多秒**。
- *      为了一个静态的、全机器一次就够的授权，让每次会话都付这个代价，
- *      是明显划不来的。
+ *   2. Backing off to writing only the volume root: still no good. Measured,
+ *      a single `icacls C:\ /grant ...` takes **16 seconds** (the children of
+ *      C:\ take part in propagation too). A session would grant at the start
+ *      and revoke at the end, so **every session.open would cost 30-odd extra
+ *      seconds** for nothing. Paying that on every session, for a grant that
+ *      is static and only needed once per machine, is plainly a bad trade.
  *
- *   所以改成：检查卷根允不允许 AppContainer 穿过去；不允许就发一条
- *   带**确切修复命令**的 warning，会话照常开。授权与否是用户的决定 ——
- *   那是改系统盘 ACL，不该由一个 agent harness 每次运行时偷偷做。
+ *   So instead: check whether the volume root lets an AppContainer traverse
+ *   it, and if not emit a warning containing the **exact fix command** while
+ *   opening the session as usual. Whether to grant it is the user's decision
+ *   -- it modifies the system drive's ACL, and an agent harness has no
+ *   business doing that quietly on every run.
  *
- *   缺了它的后果只有一个：沙箱里 `dir` / `Get-ChildItem` 列不出目录
- *   （读文件、写文件、跑程序都不受影响）。warning 里写清楚了。
+ *   The consequence of its absence is exactly one thing: `dir` /
+ *   `Get-ChildItem` cannot list directories inside the sandbox (reading files,
+ *   writing files and running programs are unaffected). The warning says so.
  */
 void CheckVolumeRoots(const Policy& p, std::vector<std::string>* warnings) {
   std::vector<std::wstring> volumes;
@@ -247,8 +269,9 @@ void CheckVolumeRoots(const Policy& p, std::vector<std::string>* warnings) {
     std::unique_ptr<void, decltype(&::LocalFree)> sd_guard(sd, &::LocalFree);
 
     bool ok = false;
-    // ★ SYNCHRONIZE 不能漏。只给 (X,RA) 的话 dir 照样 "Access is denied" ——
-    //   同步打开句柄需要它。系统自带挂在 C:\ 上的那条能力 ACE 就是 (S,RD,X,RA)。
+    // ★ SYNCHRONIZE must not be omitted. With only (X,RA), dir still says
+    //   "Access is denied" -- opening a handle synchronously requires it. The
+    //   capability ACE Windows itself ships on C:\ is (S,RD,X,RA).
     constexpr ACCESS_MASK kNeeded = FILE_READ_ATTRIBUTES | FILE_EXECUTE | SYNCHRONIZE;
     if (dacl != nullptr) {
       for (WORD i = 0; i < dacl->AceCount; ++i) {
@@ -274,7 +297,7 @@ void CheckVolumeRoots(const Policy& p, std::vector<std::string>* warnings) {
   ::LocalFree(all_packages);
 }
 
-/** 分配一个 well-known 能力 SID。调用方负责 FreeSid。 */
+/** Allocate a well-known capability SID. The caller is responsible for FreeSid. */
 PSID MakeCapabilitySid(WELL_KNOWN_SID_TYPE type) {
   DWORD n = SECURITY_MAX_SID_SIZE;
   auto* sid = static_cast<PSID>(::LocalAlloc(LPTR, n));
@@ -287,9 +310,11 @@ PSID MakeCapabilitySid(WELL_KNOWN_SID_TYPE type) {
 }
 
 /**
- * 系统只读路径在 Windows 上不需要我们授权 —— C:\Windows、Program Files 等
- * 出厂就给了 ALL APPLICATION PACKAGES 读+执行（Store 应用就靠这个跑）。
- * 这里只抽查一条，抽查不过就如实警告，而不是默默假设它成立。
+ * System read-only paths need no grant from us on Windows -- C:\Windows,
+ * Program Files and the like ship granting ALL APPLICATION PACKAGES read +
+ * execute (which is how Store apps run at all).
+ * This spot-checks one of them, and warns honestly when the check fails rather
+ * than quietly assuming it holds.
  */
 void CheckSystemReadable(std::vector<std::string>* warnings) {
   std::string sysdir;
@@ -325,24 +350,31 @@ void CheckSystemReadable(std::vector<std::string>* warnings) {
 }
 
 /**
- * 清掉上一次没来得及删的 AppContainer profile。
+ * Clear AppContainer profiles a previous run never got to delete.
  *
- * ★ 为什么需要它：正常退出时 ~Confinement 会删掉自己那个 profile，
- *   但 hxd 被 kill -9 时析构函数根本不会跑，profile 就留在系统里。
- *   开发或崩溃循环里这东西会无限堆积 —— 实测跑了几十轮测试之后攒了二十多个。
+ * ★ Why this is needed: on a clean exit ~Confinement deletes its own profile,
+ *   but when hxd is killed with -9 the destructor never runs and the profile
+ *   stays on the system. Across a development or crash loop they accumulate
+ *   without bound -- measured, a few dozen test runs had built up more than
+ *   twenty.
  *
- *   rollout 那边的对策是 append-only + 单次写（被强杀也不留半行），
- *   这里没有等价物，所以退而求其次：**启动时扫一遍**。
+ *   The rollout's answer to this is append-only plus one write per record (a
+ *   hard kill leaves no half line). There is no equivalent here, so the
+ *   fallback is the next best thing: **sweep once at startup**.
  *
- *   判据是 profile 名字里的 pid 还在不在。pid 被复用的话我们只会
- *   "跳过删除"，不会误删别人的东西 —— 失败方向是安全的那一侧。
- *   另一个 hxd 正在用的 profile 同理会被跳过。
+ *   The test is whether the pid embedded in the profile name is still alive.
+ *   If a pid has been reused we merely "skip deleting" and never delete
+ *   someone else's -- the failure direction is the safe one. A profile another
+ *   hxd is currently using is skipped for the same reason.
  *
- * ★ 枚举的是**注册表**，不是 %LOCALAPPDATA%\Packages。
- *   第一版扫目录，结果这个清扫器等于没写：CreateAppContainerProfile 只保证
- *   在 Mappings 下登记一条 moniker，那个目录是 profile 真被用到时才建的。
- *   实测连跑七个会话之后，Packages 下**一个目录都没有**，注册表里七条全在。
- *   DeleteAppContainerProfile 两边都清，所以按注册表枚举才是完整的那一侧。
+ * ★ What gets enumerated is the **registry**, not %LOCALAPPDATA%\Packages.
+ *   The first version scanned the directory, which made this sweeper a no-op:
+ *   CreateAppContainerProfile only guarantees registering a moniker under
+ *   Mappings, and that directory is created only when the profile is actually
+ *   used. Measured, after seven consecutive sessions there was **not one
+ *   directory** under Packages while all seven entries sat in the registry.
+ *   DeleteAppContainerProfile cleans both, so enumerating the registry is the
+ *   complete side.
  */
 void SweepStaleProfiles() {
   static constexpr wchar_t kMappings[] =
@@ -352,7 +384,8 @@ void SweepStaleProfiles() {
   HKEY root = nullptr;
   if (::RegOpenKeyExW(HKEY_CURRENT_USER, kMappings, 0, KEY_READ, &root) != ERROR_SUCCESS) return;
 
-  // 先收集再删：边枚举边删会让后面的索引整体前移，漏掉一半。
+  // Collect first, delete after: deleting while enumerating shifts every later
+  // index down and misses half of them.
   std::vector<std::wstring> monikers;
   for (DWORD i = 0;; ++i) {
     wchar_t sub[256]{};
@@ -375,7 +408,7 @@ void SweepStaleProfiles() {
     const std::string name = win::Narrow(w);
     if (name.rfind("hx-", 0) != 0) continue;
 
-    // hx-<pid>-<tick>（会话）或 hx-probe-<pid>（能力探测）
+    // hx-<pid>-<tick> (a session) or hx-probe-<pid> (capability probing)
     unsigned long pid = 0;
     if (name.rfind("hx-probe-", 0) == 0) {
       pid = std::strtoul(name.c_str() + 9, nullptr, 10);
@@ -388,7 +421,7 @@ void SweepStaleProfiles() {
     if (h != nullptr) {
       const bool running = ::WaitForSingleObject(h, 0) != WAIT_OBJECT_0;
       ::CloseHandle(h);
-      if (running) continue;  // 可能是另一个 hxd 正在用，别动
+      if (running) continue;  // another hxd may be using it; leave it alone
     }
     ::DeleteAppContainerProfile(w.c_str());
   }
@@ -397,10 +430,11 @@ void SweepStaleProfiles() {
 }  // namespace
 
 Confinement::~Confinement() {
-  // ★ 先撤 ACE 再删 profile。
-  //   反过来的话 SID 已经没有 profile 背书，SetEntriesInAcl 仍然能写进去，
-  //   但留下的是一条指向不存在 package 的孤儿 ACE，用户在资源管理器里
-  //   会看到一个解析不出名字的乱码条目。
+  // ★ Revoke the ACEs before deleting the profile.
+  //   The other way round, the SID no longer has a profile backing it;
+  //   SetEntriesInAcl still writes happily, but what it leaves is an orphan ACE
+  //   pointing at a package that does not exist, which the user sees in
+  //   Explorer as a garbled entry that resolves to no name.
   for (const auto& p : granted_paths) {
     if (sid != nullptr) RevokeOnPath(p, sid);
   }
@@ -416,8 +450,9 @@ bool FillSecurityCapabilities(const Confinement& c, SECURITY_CAPABILITIES* out) 
   ::ZeroMemory(out, sizeof(*out));
   out->AppContainerSid = c.sid;
   out->CapabilityCount = static_cast<DWORD>(c.cap_sids.size());
-  // Capabilities 指向调用方持有的数组；这里借用 Confinement 里的存储，
-  // 生命周期由 Confinement 保证覆盖整个 CreateProcess 调用。
+  // Capabilities points at an array the caller owns; this borrows storage from
+  // the Confinement, whose lifetime is guaranteed to cover the whole
+  // CreateProcess call.
   static thread_local std::vector<SID_AND_ATTRIBUTES> attrs;
   attrs.clear();
   for (PSID s : c.cap_sids) {
@@ -443,8 +478,9 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
     return out;
   }
 
-  // 先把上一次崩溃/被强杀留下的 profile 扫掉，再建自己的。
-  // 只在第一次 BuildConfinement 时做一次，policy.set 反复收紧时不重复扫。
+  // Sweep away profiles left by a previous crash or hard kill before creating
+  // our own. Done once, at the first BuildConfinement, so repeatedly
+  // tightening via policy.set does not re-sweep.
   static bool swept = [] {
     SweepStaleProfiles();
     return true;
@@ -453,9 +489,10 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
 
   auto conf = std::make_shared<Confinement>();
 
-  // 每会话一个唯一的 AppContainer。
-  // ★ 不复用固定名字：两个并发会话共用一个 SID 的话，A 会话为自己的 root
-  //   打的 ACE 会让 B 会话也能读 —— 两个沙箱互相开洞，而且谁都看不出来。
+  // One unique AppContainer per session.
+  // ★ Never reuse a fixed name: if two concurrent sessions shared a SID, the
+  //   ACE session A stamps for its own root would let session B read it too --
+  //   two sandboxes punching holes in each other, and invisibly at that.
   wchar_t name[64];
   ::swprintf(name, 64, L"hx-%lu-%llx", static_cast<unsigned long>(::GetCurrentProcessId()),
              static_cast<unsigned long long>(::GetTickCount64()));
@@ -474,12 +511,13 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
   }
   conf->sid = sid;
 
-  // ---- 网络 ----
+  // ---- network ----
   //
-  // ★ 这是整个移植里最干净的一处对位。
-  //   Linux 需要 Landlock(TCP) + seccomp(AF_INET，为了覆盖 UDP/DNS) 两层；
-  //   Windows 只需要「不授予 internetClient 能力」，WFP 在内核里
-  //   把 TCP 和 UDP 一起挡掉。没有 UDP 盲区，所以也不需要第二层。
+  // ★ The cleanest correspondence in the entire port.
+  //   Linux needs two layers, Landlock(TCP) + seccomp(AF_INET, to cover
+  //   UDP/DNS); Windows needs only "do not grant the internetClient
+  //   capability", and WFP blocks TCP and UDP alike in the kernel. There is no
+  //   UDP blind spot, so there is no second layer either.
   if (p.net == NetMode::kAllow) {
     PSID net_cap = MakeCapabilitySid(WinCapabilityInternetClientSid);
     if (net_cap != nullptr) {
@@ -489,12 +527,13 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
       out.warnings.push_back("cannot derive internetClient capability: network will be denied");
     }
   }
-  // net:deny 时什么能力都不给 —— 默认就是断网，且是内核强制的。
+  // Under net:deny no capability is granted at all -- offline is the default,
+  // and it is kernel-enforced.
   out.net_enforced = (p.net == NetMode::kDeny);
 
   CheckSystemReadable(&out.warnings);
 
-  // ---- 文件系统 ----
+  // ---- filesystem ----
   constexpr DWORD kRead = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
   constexpr DWORD kWrite = FILE_ALL_ACCESS;
 
@@ -517,15 +556,17 @@ RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
     }
   }
 
-  // 会话私有 tmp 永远可写。少了它，凡是要落临时文件的工具（编译器、打包器）
-  // 都会莫名其妙地失败 —— 与 Linux 侧给 TMPDIR 授权是同一个理由。
+  // The session-private tmp is always writable. Without it every tool that
+  // needs a temp file (compilers, bundlers) fails for no visible reason -- the
+  // same reason the Linux side grants TMPDIR.
   if (p.sandbox == SandboxMode::kWorkspaceWrite && !p.tmpdir.empty()) {
     const std::wstring w = win::Widen(p.tmpdir);
     if (GrantOnPath(w, sid, kWrite, &out.warnings)) conf->granted_paths.push_back(w);
   }
 
-  // ★ 卷根只检查不修改：缺授权时发一条带修复命令的 warning。
-  //   详见 CheckVolumeRoots —— 每会话去写卷根 ACL 要 30+ 秒，划不来。
+  // ★ Volume roots are checked, never modified: when the grant is missing,
+  //   emit a warning carrying the fix command. See CheckVolumeRoots -- writing
+  //   the volume root ACL per session costs 30+ seconds, which is a bad trade.
   CheckVolumeRoots(p, &out.warnings);
 
   out.conf = std::move(conf);

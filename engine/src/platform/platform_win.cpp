@@ -16,17 +16,19 @@ int64_t FiletimeToUnixMs(const FILETIME& ft) {
   ULARGE_INTEGER u{};
   u.LowPart = ft.dwLowDateTime;
   u.HighPart = ft.dwHighDateTime;
-  // FILETIME 是 1601-01-01 起的 100ns 单位
+  // FILETIME counts 100ns units since 1601-01-01
   constexpr int64_t kEpochDiff100ns = 116444736000000000LL;
   return (static_cast<int64_t>(u.QuadPart) - kEpochDiff100ns) / 10000;
 }
 
 /**
- * 去掉 GetFinalPathNameByHandleW 的扩展前缀。
+ * Strip the extended prefix that GetFinalPathNameByHandleW produces.
  *
- * ★ 为什么不直接留着：扩展前缀路径绕过 Win32 的路径规范化，很多第三方工具
- *   （以及 CreateProcess 的 lpCurrentDirectory）对它反应不一。引擎内部统一
- *   用普通 DOS 路径，需要长路径时在调用点自己加前缀。
+ * ★ Why not just keep it: extended-prefix paths bypass Win32 path
+ *   normalization, and plenty of third-party tools (as well as
+ *   CreateProcess's lpCurrentDirectory) react to them inconsistently. The
+ *   engine uses ordinary DOS paths internally and adds the prefix at the call
+ *   site when a long path is actually needed.
  */
 std::wstring StripExtendedPrefix(std::wstring p) {
   if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) return L"\\\\" + p.substr(8);
@@ -41,8 +43,8 @@ bool GetAttrs(const std::string& p, WIN32_FILE_ATTRIBUTE_DATA* out) {
 }  // namespace
 
 int64_t NowMs() {
-  // QPC 是单调的。deadline 全靠这个，绝不能用挂钟（GetSystemTime）——
-  // 用户改一次系统时间就会让所有超时错乱。
+  // QPC is monotonic. Every deadline rests on it; never the wall clock
+  // (GetSystemTime) -- one change of the system time throws off all timeouts.
   static LARGE_INTEGER freq = [] {
     LARGE_INTEGER f{};
     ::QueryPerformanceFrequency(&f);
@@ -57,15 +59,16 @@ int64_t NowMs() {
 int64_t Pid() { return static_cast<int64_t>(::GetCurrentProcessId()); }
 
 bool RealPath(const std::string& in, std::string* out) {
-  // ★ 这是 Windows 上的「解析后路径」。
-  //   打开句柄再问内核要最终路径，等价于 POSIX realpath：
-  //   符号链接、junction、mount point、8.3 短名、大小写全部被解开。
-  //   path_guard 的逃逸防护依赖这一点 —— 只用 GetFullPathNameW 做字符串
-  //   规范化的话，junction 指出 root 的情况会被整个漏掉。
+  // ★ This is the "resolved path" on Windows.
+  //   Open a handle and ask the kernel for the final path -- the equivalent of
+  //   POSIX realpath: symlinks, junctions, mount points, 8.3 short names and
+  //   casing are all resolved. path_guard's escape protection depends on it;
+  //   doing only string normalization with GetFullPathNameW would miss a
+  //   junction pointing out of the root entirely.
   const std::wstring w = win::Widen(in);
-  HANDLE h = ::CreateFileW(w.c_str(), 0,  // 只要元数据，不要访问权
+  HANDLE h = ::CreateFileW(w.c_str(), 0,  // metadata only, no access rights
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,  // 目录也要能打开
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,  // directories too
                            nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;
   std::wstring buf(MAX_PATH, L'\0');
@@ -106,8 +109,9 @@ bool Stat(const std::string& p, StatInfo* out) {
   sz.LowPart = a.nFileSizeLow;
   sz.HighPart = a.nFileSizeHigh;
   out->size = static_cast<int64_t>(sz.QuadPart);
-  // Windows 没有 POSIX 权限位。合成一个诚实的近似：只读属性 -> 0444，否则 0644。
-  // 协议里这个字段只用于展示，不参与任何决策。
+  // Windows has no POSIX permission bits. Synthesize an honest approximation:
+  // the read-only attribute -> 0444, otherwise 0644. In the protocol this
+  // field is display-only and feeds into no decision.
   const bool ro = (a.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
   out->mode = out->is_dir ? (ro ? 0555 : 0755) : (ro ? 0444 : 0644);
   out->mtime_ms = FiletimeToUnixMs(a.ftLastWriteTime);
@@ -117,7 +121,8 @@ bool Stat(const std::string& p, StatInfo* out) {
 bool MakeDirs(const std::string& path, std::string* err) {
   const std::string norm = Normalize(path);
   size_t i = 0;
-  // 跳过根（"C:\" 或 UNC 的 \\server\share）—— 对根调 CreateDirectory 必然失败
+  // Skip the root ("C:\", or \\server\share for UNC) -- calling
+  // CreateDirectory on a root always fails
   if (norm.size() >= 2 && norm[1] == ':') {
     i = (norm.size() >= 3 && IsSeparator(norm[2])) ? 3 : 2;
   } else if (norm.size() >= 2 && IsSeparator(norm[0]) && IsSeparator(norm[1])) {
@@ -153,8 +158,9 @@ bool MakeTempDir(const std::string& prefix, std::string* out, std::string* err) 
     return false;
   }
   base.resize(n);
-  // ★ 不用 GetTempFileName：它会先建一个**文件**，我们要的是目录。
-  //   CreateDirectory 本身是原子的，撞名就换一个再试。
+  // ★ Not GetTempFileName: it creates a **file** first, and we want a
+  //   directory. CreateDirectory is itself atomic, so on a name collision we
+  //   just pick another and retry.
   static unsigned counter = 0;
   for (int attempt = 0; attempt < 64; ++attempt) {
     char suffix[96];
@@ -163,9 +169,11 @@ bool MakeTempDir(const std::string& prefix, std::string* out, std::string* err) 
                static_cast<unsigned long long>(::GetTickCount64()));
     const std::string cand = win::Narrow(base) + suffix;
     if (::CreateDirectoryW(win::Widen(cand).c_str(), nullptr) != 0) {
-      // ★ 回解析一次。GetTempPath 常常给出带 8.3 短名的路径（例如 RUNNER~1），
-      //   而 roots 的包含判断用的是解析后路径。这里不解析，后面必然对不上，
-      //   表现为「明明授权了 tmpdir，工具写临时文件还是被拒」。
+      // ★ Resolve it once more. GetTempPath frequently hands back a path
+      //   containing 8.3 short names (e.g. RUNNER~1), while root containment
+      //   checks operate on resolved paths. Skip this and the two can never
+      //   match, which shows up as "the tmpdir is clearly authorized, yet a
+      //   tool writing a temp file still gets denied".
       if (!RealPath(cand, out)) *out = cand;
       return true;
     }
@@ -219,26 +227,29 @@ bool ListDir(const std::string& dir, std::vector<std::string>* names) {
 }
 
 bool MatchComponent(const std::string& pattern, const std::string& name) {
-  // ★ 不用 PathMatchSpecW：它带着一堆 MS-DOS 遗留特例（"*.*" 会匹配无扩展名的
-  //   文件、末尾的点被忽略），同一个 glob 在两个平台上会给出不同结果。
-  //   自己写一个与 fnmatch(FNM_PATHNAME) 语义一致的，只有大小写敏感性随平台。
+  // ★ Not PathMatchSpecW: it carries a pile of MS-DOS legacy special cases
+  //   ("*.*" matches files with no extension, trailing dots are ignored), so
+  //   the same glob would give different results on the two platforms.
+  //   Hand-roll one matching fnmatch(FNM_PATHNAME) semantics instead; only
+  //   case sensitivity varies by platform.
   const std::string p = FoldCase(pattern);
   const std::string s = FoldCase(name);
-  // 迭代式回溯：遇到 '*' 记住分叉点，失配就回去让它多吃一个字符。
-  // 递归版在 "a*a*a*..." 这类模式上会指数爆炸。
+  // Iterative backtracking: on '*' remember the branch point, and on a
+  // mismatch go back and let it consume one more character.
+  // A recursive version blows up exponentially on patterns like "a*a*a*...".
   size_t pi = 0, si = 0;
   size_t star = std::string::npos, match = 0;
   while (si < s.size()) {
     bool advanced = false;
     if (pi < p.size() && p[pi] == '[') {
-      // 字符类：[abc] / [!a-z] / []abc]
+      // Character class: [abc] / [!a-z] / []abc]
       size_t close = pi + 1;
       bool neg = false;
       if (close < p.size() && (p[close] == '!' || p[close] == '^')) {
         neg = true;
         ++close;
       }
-      if (close < p.size() && p[close] == ']') ++close;  // 首位的 ] 是字面量
+      if (close < p.size() && p[close] == ']') ++close;  // a leading ] is literal
       while (close < p.size() && p[close] != ']') ++close;
       if (close < p.size()) {
         bool hit = false;
@@ -255,13 +266,13 @@ bool MatchComponent(const std::string& pattern, const std::string& name) {
           ++si;
           advanced = true;
         }
-      } else if (p[pi] == s[si]) {  // 没有闭合的 ']'，'[' 当字面量
+      } else if (p[pi] == s[si]) {  // no closing ']', so '[' is literal
         ++pi;
         ++si;
         advanced = true;
       }
     } else if (pi < p.size() && p[pi] == '?') {
-      if (!IsSeparator(s[si])) {  // FNM_PATHNAME：'?' 不跨分隔符
+      if (!IsSeparator(s[si])) {  // FNM_PATHNAME: '?' does not cross a separator
         ++pi;
         ++si;
         advanced = true;
@@ -276,7 +287,8 @@ bool MatchComponent(const std::string& pattern, const std::string& name) {
       advanced = true;
     }
     if (advanced) continue;
-    // 失配：回到上一个 '*'，让它多吃一个字符（但 '*' 同样不跨分隔符）
+    // Mismatch: go back to the last '*' and let it eat one more character
+    // (but '*' does not cross a separator either)
     if (star != std::string::npos && match < s.size() && !IsSeparator(s[match])) {
       pi = star + 1;
       si = ++match;
@@ -317,15 +329,17 @@ std::string Parent(const std::string& p) {
   const std::string n = Normalize(p);
   const size_t slash = n.find_last_of('\\');
   if (slash == std::string::npos) return ".";
-  // "C:\x" 的父是 "C:\"，不是 "C:"（后者是「当前目录」，语义完全不同）
+  // The parent of "C:\x" is "C:\", not "C:" (the latter means "the current
+  // directory on drive C" -- entirely different semantics)
   if (slash == 2 && n.size() >= 3 && n[1] == ':') return n.substr(0, 3);
   if (slash == 0) return "\\";
   return n.substr(0, slash);
 }
 
 std::string FoldCase(const std::string& p) {
-  // ★ NTFS 默认大小写不敏感。roots 的包含判断若按字节比，
-  //   "C:\Repo" 与 "c:\repo" 会被判成两个不同的 root —— 逃逸就从这里进来。
+  // ★ NTFS is case-insensitive by default. If root containment compared
+  //   bytes, "C:\Repo" and "c:\repo" would be judged two different roots --
+  //   and that is exactly where an escape gets in.
   std::string out = Normalize(p);
   for (char& c : out) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -339,7 +353,7 @@ bool IsWithin(const std::string& path, const std::string& root) {
   if (p.size() < r.size()) return false;
   if (p.compare(0, r.size(), r) != 0) return false;
   if (p.size() == r.size()) return true;
-  if (IsSeparator(r.back())) return true;  // root 是 "C:\" 这种带尾分隔符的
+  if (IsSeparator(r.back())) return true;  // root already ends in a separator, e.g. "C:\"
   return IsSeparator(p[r.size()]);
 }
 

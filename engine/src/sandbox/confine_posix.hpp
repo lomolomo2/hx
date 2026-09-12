@@ -1,8 +1,9 @@
-// Linux 的 Confinement 定义：一个 Landlock ruleset fd。
+// The Linux definition of Confinement: a Landlock ruleset fd.
 //
-// ★ 顺序契约（写错等于没做沙箱）：
-//     父进程 BuildConfinement()  →  fork()  →  子进程 ApplyRestrictSelf()  →  execve()
-//   Landlock 不能撤销已经打开的 fd，所以必须在 execve 之前、且在子进程里施加。
+// ★ The ordering contract (get it wrong and there is no sandbox at all):
+//     parent BuildConfinement() -> fork() -> child ApplyRestrictSelf() -> execve()
+//   Landlock cannot revoke already-open fds, so it must be applied before
+//   execve and inside the child.
 #pragma once
 #ifndef _WIN32
 
@@ -21,8 +22,9 @@ struct Confinement {
   }
 };
 
-// 在 fork 之后的子进程里调用；失败返回 false 并填 err。
-// 内部会先 prctl(PR_SET_NO_NEW_PRIVS)，这是 landlock_restrict_self 的前置要求。
+// Called in the child after fork; returns false with err filled in.
+// It calls prctl(PR_SET_NO_NEW_PRIVS) first, which landlock_restrict_self
+// requires.
 bool ApplyRestrictSelf(const Confinement* conf, std::string* err);
 
 uint64_t FsAccessMaskForAbi(int abi);

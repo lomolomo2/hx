@@ -1,6 +1,8 @@
-// 可脚本化的假模型：让端到端测试确定、离线、免费。
+// A scriptable fake model, making end-to-end tests deterministic, offline and
+// free.
 //
-// 真实模型用来验"好不好"，假模型用来验"对不对" —— 后者才是回归测试该做的事。
+// A real model verifies "is it good"; a fake model verifies "is it correct" --
+// and the latter is what a regression test is for.
 import type { AssistantTurn, ModelClient, ModelMessage } from "./types.js";
 
 export type Script = (messages: ModelMessage[], step: number) => AssistantTurn;

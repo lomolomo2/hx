@@ -1,7 +1,8 @@
 import type { Rule } from "./rules.js";
 
-// 高危命令：不是"禁止"，而是"值得停下来问一句"。
-// 挑选标准：不可逆、影响工作区之外、或会对外发布。
+// Dangerous commands: not "forbidden" but "worth stopping to ask about".
+// Selection criteria: irreversible, reaching outside the workspace, or
+// publishing something externally.
 const DANGEROUS_BASH = [
   "*rm -rf *",
   "*rm -fr *",
@@ -25,11 +26,13 @@ export type PresetName = "auto" | "cautious" | "strict";
 export function preset(name: PresetName): Rule[] {
   switch (name) {
     case "auto":
-      // 全自动：一切放行。沙箱仍然在，只是不再就意图发问。
+      // Fully automatic: everything allowed. The sandbox is still there; it
+      // simply stops asking about intent.
       return [];
 
     case "cautious":
-      // 默认推荐：日常操作放行，高危命令问一句。
+      // The recommended default: everyday operations pass, dangerous commands
+      // get a question.
       return DANGEROUS_BASH.map((pattern) => ({
         permission: "bash",
         pattern,
@@ -37,7 +40,8 @@ export function preset(name: PresetName): Rule[] {
       }));
 
     case "strict":
-      // 任何有副作用的动作都要问：跑命令、改文件。只读操作仍然放行。
+      // Every action with a side effect gets a question: running commands,
+      // changing files. Read-only operations still pass.
       return [
         { permission: "bash", pattern: "*", action: "ask" },
         { permission: "apply_patch", pattern: "*", action: "ask" },

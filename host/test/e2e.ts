@@ -1,7 +1,8 @@
-// M5 判据：端到端跑通一个多步任务。
+// The M5 criterion: a multi-step task runs end to end.
 //
-// 用可脚本化的假模型，所以这个测试是确定的、离线的、免费的 ——
-// 它验的是"管道对不对"，不是"模型好不好"。
+// It uses the scriptable fake model, so this test is deterministic, offline
+// and free -- it verifies that the pipeline is correct, not that the model is
+// good.
 import { EngineClient } from "../src/engine/client.js";
 import { Agent } from "../src/loop/turn.js";
 import { ScriptedModelClient, callTool, say } from "../src/model/scripted.js";
@@ -18,7 +19,8 @@ if (!ws) {
 }
 
 
-// 模型的剧本：立计划 → 跑测试(失败) → 读文件 → 打补丁 → 再跑(通过) → 收尾
+// The model's script: make a plan -> run the tests (fail) -> read the file ->
+// apply a patch -> run again (pass) -> wrap up
 const script = (_msgs: unknown, step: number): AssistantTurn => {
   switch (step) {
     case 0:
@@ -29,7 +31,8 @@ const script = (_msgs: unknown, step: number): AssistantTurn => {
         ],
       });
     case 1:
-      // 跑测试的命令随平台变，见 test/fixtures.ts 里挑解释器的理由。
+      // The command that runs the tests varies by platform; see the reasoning
+      // behind the interpreter choice in test/fixtures.ts.
       return callTool("c1", "bash", { cmd: fixture.runCommand });
     case 2:
       return callTool("c2", "read", { path: "calc.py" });
@@ -66,7 +69,7 @@ const check = (name: string, cond: boolean, detail = ""): void => {
 await agent.open({ roots: [ws], sandbox: "workspace-write", net: "deny", name: "e2e" });
 const result = await agent.run("The add() function is broken. Find it, fix it, and verify.");
 
-// --- 断言 ---
+// --- assertions ---
 const cmds = events.flatMap((e) =>
   e.type === "item.completed" && e.item.type === "command_execution" ? [e.item] : [],
 );
@@ -75,21 +78,22 @@ const patches = events.flatMap((e) =>
 );
 
 console.log();
-check("走到了最终回复", result.stoppedBecause === "final_message", result.stoppedBecause);
-check("第一次跑测试失败", cmds[0]?.exitCode !== 0, `exit=${cmds[0]?.exitCode}`);
-check("补丁落盘成功", patches[0]?.status === "completed" && patches[0]?.changes[0]?.path === fixture.sourceName);
-check("修完后测试通过", cmds[1]?.exitCode === 0, `exit=${cmds[1]?.exitCode} out=${cmds[1]?.output?.slice(0, 80)}`);
-check("沙箱确实生效", agent.sandbox?.enforced === true);
-check("有 thread.started 事件", events[0]?.type === "thread.started");
-check("循环结束时回到 settling", agent.phase === "settling");
+check("reached a final message", result.stoppedBecause === "final_message", result.stoppedBecause);
+check("the first test run failed", cmds[0]?.exitCode !== 0, `exit=${cmds[0]?.exitCode}`);
+check("the patch was written", patches[0]?.status === "completed" && patches[0]?.changes[0]?.path === fixture.sourceName);
+check("the tests pass after the fix", cmds[1]?.exitCode === 0, `exit=${cmds[1]?.exitCode} out=${cmds[1]?.output?.slice(0, 80)}`);
+check("the sandbox really was enforced", agent.sandbox?.enforced === true);
+check("a thread.started event was emitted", events[0]?.type === "thread.started");
+check("the loop returned to settling", agent.phase === "settling");
 
-// 文件真的被改了（经引擎读回，宿主自己不碰 fs）
+// The file really was changed (read back through the engine; the host never
+// touches fs itself)
 const after = await engine.fsRead(fixture.sourceName);
-check("文件内容确实变成了 a + b", after.content.includes(fixture.fixedMarker));
+check("the file content really became a + b", after.content.includes(fixture.fixedMarker));
 
-// 两条流分离：给模型的历史里不含 UI 事件
+// The two streams stay separate: the model's history contains no UI events
 const historyRoles = agent.history.map((m) => m.role);
-check("历史里有 user/assistant/tool 三种角色", new Set(historyRoles).size === 3, historyRoles.join(","));
+check("history holds all three roles: user/assistant/tool", new Set(historyRoles).size === 3, historyRoles.join(","));
 
 console.log(`\nsteps=${result.steps} failures=${failures}`);
 engine.close();

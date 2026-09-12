@@ -1,12 +1,16 @@
-// Engine —— hxd 的事件循环与操作分发。
+// Engine -- hxd's event loop and op dispatch.
 //
-// 单线程 reactor：stdin（宿主请求）+ 所有 cell 的流 + 定时器（wait 截止/进程超时）
-// 都在同一个循环里。引擎状态只被这一个线程改，因此没有锁，也没有竞态。
+// A single-threaded reactor: stdin (host requests), every cell's streams, and
+// the timers (wait deadlines / process timeouts) all live in one loop. Engine
+// state is mutated by this thread alone, so there are no locks and no races.
 //
-// ★ 平台差异只藏在 io::Reactor 后面（Linux epoll / Windows IOCP），
-//   下面这些逻辑一行都不该因为换了操作系统而分叉。
-//   唯一的例外记在 io_win.cpp 顶部：Windows 上 stdio 由两个搬字节的线程驱动，
-//   因为宿主给的标准句柄是同步的、进不了 IOCP。那两个线程不碰这里的任何状态。
+// ★ Platform differences hide entirely behind io::Reactor (Linux epoll /
+//   Windows IOCP); not one line of the logic below should fork because the
+//   operating system changed.
+//   The sole exception is recorded at the top of io_win.cpp: on Windows stdio
+//   is driven by two byte-shuffling threads, because the standard handles the
+//   host provides are synchronous and cannot join an IOCP. Those two threads
+//   touch none of the state here.
 #pragma once
 
 #include <cstdint>
@@ -28,8 +32,9 @@
 
 namespace hx {
 
-// 尚未答复的 exec.wait。协议保证每个请求恰好一个响应，
-// 所以这里必须记住 req_id，到期或有数据时补发。
+// An exec.wait that has not been answered yet. The protocol guarantees exactly
+// one response per request, so the req_id has to be remembered here and the
+// response sent later, on expiry or when data arrives.
 struct PendingWait {
   std::string req_id;
   std::string cell_id;
@@ -50,7 +55,7 @@ class Engine {
   const Caps& caps() const { return caps_; }
 
  private:
-  // 返回 nullopt 表示"延后答复"（目前只有 exec.wait 会这样）
+  // Returning nullopt means "answer later" (currently only exec.wait does)
   using Handler = std::function<std::optional<json>(const Request&)>;
 
   void RegisterOps();
@@ -73,7 +78,7 @@ class Engine {
 
   bool WriteAllowed() const { return policy_.sandbox != SandboxMode::kReadOnly; }
 
-  // 事件循环内部
+  // Event loop internals
   int ComputeTimeoutMs() const;
   void OnCellFdReadable(io::Fd fd);
   void CloseCellFd(Cell* c, io::Fd fd);
@@ -88,14 +93,17 @@ class Engine {
   std::vector<std::string> BuildEnv(const json& overrides) const;
   json EffectiveJson() const;
 
-  // ★ 出站必须是非阻塞的。
-  //   早先 Emit 直接 write(stdout)：一旦宿主读得慢（或子进程输出爆量），
-  //   管道写满，单线程引擎就阻塞在 write() 里 —— 超时不生效、进程不回收、
-  //   整个事件循环冻结。一个慢速宿主就能让引擎停摆。
-  //   现在：事件进出站队列，队列满了丢事件；响应永远不丢（协议契约是
-  //   每个请求恰好一个响应）。
-  void Emit(const json& j);          // 事件，可丢
-  void Reply(const json& j);         // 响应，不可丢
+  // ★ The outbound path must be non-blocking.
+  //   Emit used to write(stdout) directly: the moment the host read slowly (or
+  //   a child produced a flood of output) the pipe filled, and the
+  //   single-threaded engine blocked inside write() -- timeouts stopped
+  //   firing, processes stopped being reaped, and the whole event loop froze.
+  //   One slow host was enough to bring the engine to a halt.
+  //   Now: events go into an outbound queue, and events are dropped when it is
+  //   full; responses are never dropped (the protocol contract is exactly one
+  //   response per request).
+  void Emit(const json& j);          // an event; droppable
+  void Reply(const json& j);         // a response; never dropped
   void Send(std::string line, bool droppable);
   void FlushOut();
 
@@ -109,14 +117,16 @@ class Engine {
   std::string tmpdir_;
 
   /**
-   * 待清扫的进程组。
+   * Process groups still to be swept.
    *
-   * ★ 故意不挂在 Cell 上：cell 一旦 done 就会被 exec.wait 回收，
-   *   而进程树的清理往往要持续更久（fork 炸弹要扫很多轮）。
-   *   把清理绑在汇报生命周期上，结果就是「cell 结束了、进程还在」。
+   * ★ Deliberately not hung off Cell: a cell is reaped by exec.wait as soon as
+   *   it is done, while cleaning up the process tree often has to continue
+   *   much longer (a fork bomb takes many sweeps). Tying cleanup to the
+   *   reporting lifecycle produces exactly "the cell finished but the
+   *   processes are still there".
    */
   struct PendingKill {
-    Proc proc;  // 自己持有一份组句柄，与 cell 的生命周期解耦
+    Proc proc;  // holds its own copy of the group handle, decoupled from the cell's lifetime
     int sweeps_left;
     int64_t next_sweep_ms;
   };
@@ -129,7 +139,7 @@ class Engine {
   bool running_ = true;
 
   std::string out_buf_;
-  bool out_watched_ = false;   // stdout 是否已挂上「关注可写」
+  bool out_watched_ = false;   // whether "watch for writable" is on for stdout
   uint64_t dropped_events_ = 0;
 };
 

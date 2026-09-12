@@ -1,6 +1,6 @@
-// hx —— 命令行入口。
-//   tsx src/cli.ts --root /path/to/repo "把 tests 里失败的用例修好"   # 一次性
-//   tsx src/cli.ts --root /path/to/repo                              # 交互式（REPL）
+// hx -- the command-line entry point.
+//   tsx src/cli.ts --root /path/to/repo "fix the failing tests"   # one-shot
+//   tsx src/cli.ts --root /path/to/repo                           # interactive (REPL)
 import { createInterface, type Interface as Readline } from "node:readline/promises";
 
 import { EngineClient } from "./engine/client.js";
@@ -34,7 +34,8 @@ function parseArgs(argv: string[]) {
     else if (a === "--engine" && argv[i + 1]) opts.hxd = argv[++i]!;
     else if (a === "--max-steps" && argv[i + 1]) opts.maxSteps = Number(argv[++i]);
     else if (a === "--approval" && argv[i + 1]) opts.approval = argv[++i]!;
-    // 额外只读授权（可重复）。默认集合很窄：$HOME、/sys/fs/cgroup 都不在里面。
+    // Extra read-only grants (repeatable). The default set is narrow: neither
+    // $HOME nor /sys/fs/cgroup is in it.
     else if (a === "--read-path" && argv[i + 1]) opts.readPaths.push(argv[++i]!);
     else rest.push(a!);
   }
@@ -82,7 +83,8 @@ function render(e: ThreadEvent): void {
       }
       break;
     case "approval.requested":
-      // 事件只负责显示；真正的提问在 handler 里，避免两处各打印一遍
+      // The event only displays; the actual question lives in the handler, so
+      // it is not printed twice
       break;
     case "approval.resolved":
       console.log(`  ${e.decision === "deny" ? "✗ denied" : "✓ approved"}`);
@@ -105,15 +107,19 @@ function render(e: ThreadEvent): void {
 }
 
 /**
- * 交互式审批。非 TTY 时一律拒绝 —— 没人能回答却放行，等于规则不存在。
+ * Interactive approval. Always deny when not a TTY -- allowing something
+ * nobody can answer is the same as the rule not existing.
  *
- * ★ 交互模式下必须**复用** REPL 那个 readline，不能自己再开一个：
- *   同一个 stdin 上两个 readline 会互相抢输入，而且先关掉的那个会把已经
- *   读进缓冲区的字节一起吞掉（粘贴多行时尤其明显）。
+ * ★ In interactive mode it must **reuse** the REPL's readline rather than
+ *   opening another: two readlines on one stdin fight over input, and whichever
+ *   closes first also swallows the bytes already in the buffer (most visible
+ *   when pasting multiple lines).
  *
- *   传的是个盒子而不是实例，因为 handler 要在 Agent 构造时就位，而那个
- *   readline 得等 session 开完才能建 —— readline 一建出来就开始吃 stdin，
- *   建早了这中间输入的东西没人接，直接丢。
+ *   What gets passed is a box rather than an instance, because the handler has
+ *   to be in place when the Agent is constructed while that readline can only
+ *   be created once the session is open -- a readline starts consuming stdin
+ *   the moment it exists, so creating it early means anything typed in the
+ *   meantime has no reader and is simply dropped.
  */
 function makeApprovalHandler(box?: { rl?: Readline }): ApprovalHandler | undefined {
   if (!process.stdin.isTTY) return undefined;
@@ -121,9 +127,9 @@ function makeApprovalHandler(box?: { rl?: Readline }): ApprovalHandler | undefin
     const shared = box?.rl;
     const rl = shared ?? createInterface({ input: process.stdin, output: process.stdout });
     try {
-      console.log(`\n  ⚠ 需要授权 — ${req.tool}`);
+      console.log(`\n  ⚠ approval needed — ${req.tool}`);
       for (const line of req.preview.split("\n").slice(0, 12)) console.log(`    ${line}`);
-      const ans = (await rl.question("    [y] 允许一次  [a] 总是允许  [n] 拒绝 (默认 n) > ")).trim().toLowerCase();
+      const ans = (await rl.question("    [y] allow once  [a] always allow  [n] deny (default n) > ")).trim().toLowerCase();
       const decision: ApprovalDecision = ans === "y" ? "allow_once" : ans === "a" ? "allow_always" : "deny";
       return decision;
     } finally {
@@ -133,36 +139,43 @@ function makeApprovalHandler(box?: { rl?: Readline }): ApprovalHandler | undefin
 }
 
 const REPL_HELP = [
-  "  /help            这份帮助",
-  "  /tools           本轮模型真正能看到的工具（策略隐藏体现在这里）",
-  "  /sandbox         这个会话的沙箱实况（enforced / backend / 警告）",
-  "  /exit, /quit     退出（Ctrl+D 或空提示符下 Ctrl+C 也一样）",
+  "  /help            this help",
+  "  /tools           the tools the model can actually see this turn (policy hiding shows up here)",
+  "  /sandbox         this session's sandbox reality (enforced / backend / warnings)",
+  "  /exit, /quit     quit (Ctrl+D, or Ctrl+C at an empty prompt, do the same)",
   "",
-  "  直接输入任务回车即可。跑到一半 Ctrl+C 会在**阶段边界**中断：",
-  "  已经起来的命令交给引擎的超时和 exec.kill 收尾，不会留下半截副作用。",
+  "  Just type a task and press enter. Ctrl+C mid-run interrupts at a *phase",
+  "  boundary*: commands already started are wound up by the engine's timeout",
+  "  and exec.kill, so no half-finished side effects are left behind.",
 ].join("\n");
 
 /**
- * 交互式多轮。同一个 Agent 实例反复 run()，历史与会话都留着。
+ * Interactive multi-turn. The same Agent instance is run() repeatedly, keeping
+ * both the history and the session.
  *
- * ★ 整个 REPL 共用**一个** readline（审批提问也用它，见 makeApprovalHandler）。
- *   一开始写成每轮开关一次，结果第二轮直接读到 EOF —— 关掉的那个 readline
- *   把已经进了缓冲区的后续输入一并丢了。
+ * ★ The whole REPL shares **one** readline (the approval question uses it too;
+ *   see makeApprovalHandler). This was first written to open and close one per
+ *   turn, and the second turn read EOF immediately -- the readline being
+ *   closed discarded the buffered input that followed along with it.
  *
- * ★ 取一行用的是常驻的 'line' 监听 + 队列，而不是每轮 rl.question()。
- *   question() 只在**被调用的那一刻**接一行；模型跑着的时候敲进来的东西
- *   照样被 readline 读走，但没人接，于是无声丢掉。管道喂输入时更极端：
- *   readline 一口气把整个管道读完，第一行之后全丢，然后 EOF 直接退出。
- *   队列把"读"和"取"解耦，顺带就有了 typeahead。
- *   审批提问不会被这个监听抢走 —— readline 在 question 挂起时不发 'line'。
+ * ★ A line is taken via a persistent 'line' listener plus a queue, not
+ *   rl.question() per turn. question() accepts a line only **at the moment it
+ *   is called**; anything typed while the model is running is still read by
+ *   readline, has no receiver, and is silently dropped. Feeding input through
+ *   a pipe is more extreme still: readline consumes the entire pipe in one go,
+ *   everything after the first line is lost, and then EOF exits outright.
+ *   The queue decouples "reading" from "taking", and gives typeahead for free.
+ *   The approval question is not stolen by this listener -- readline does not
+ *   emit 'line' while a question is pending.
  *
- * ★ Ctrl+C 有两种语义，靠 running 区分：
- *   提示符上 = 退出；任务跑到一半 = agent.abort()（在阶段边界生效，不当场
- *   掐断 —— 半路砍掉工具会留下引擎并不知情的副作用）。
+ * ★ Ctrl+C has two meanings, distinguished by `running`:
+ *   at the prompt = quit; mid-task = agent.abort() (which takes effect at a
+ *   phase boundary rather than cutting in immediately -- severing a tool
+ *   halfway leaves side effects the engine knows nothing about).
  */
 async function repl(agent: Agent, root: string, box: { rl?: Readline }): Promise<number> {
-  console.log(`\n  工作区 ${root}`);
-  console.log("  输入任务回车执行，/help 看命令。\n");
+  console.log(`\n  workspace ${root}`);
+  console.log("  Type a task and press enter. /help for commands.\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   box.rl = rl;
@@ -188,7 +201,7 @@ async function repl(agent: Agent, root: string, box: { rl?: Readline }): Promise
   });
   rl.on("SIGINT", () => {
     if (running) {
-      console.log("\n  ⚠ 中断中 —— 等当前阶段结束");
+      console.log("\n  ⚠ interrupting — waiting for the current phase to end");
       agent.abort();
     } else {
       eof = true;
@@ -222,12 +235,12 @@ async function repl(agent: Agent, root: string, box: { rl?: Readline }): Promise
       else if (cmd === "tools") console.log(`  ${agent.availableTools.join(", ")}`);
       else if (cmd === "sandbox") {
         const s = agent.sandbox;
-        if (!s) console.log("  (会话未打开)");
+        if (!s) console.log("  (no session open)");
         else {
           console.log(`  ${s.sandbox}/${s.net}  enforced=${s.enforced}  net_enforced=${s.netEnforced}  backend=${s.backend}`);
           for (const w of s.warnings) console.log(`  ! ${w}`);
         }
-      } else console.log(`  未知命令 ${line}（/help）`);
+      } else console.log(`  unknown command ${line} (try /help)`);
       console.log();
       continue;
     }
@@ -247,12 +260,14 @@ async function repl(agent: Agent, root: string, box: { rl?: Readline }): Promise
 
 async function main(): Promise<number> {
   const opts = parseArgs(process.argv.slice(2));
-  // 没给任务：有终端就进交互模式，没终端（管道/CI）就报用法。
-  // ★ 不能在非 TTY 下进 REPL —— 那会读到 EOF 立刻退出，看起来像"什么都没干"。
+  // No task given: with a terminal, enter interactive mode; without one (a
+  // pipe, CI) print usage.
+  // ★ The REPL must not run without a TTY -- it would read EOF and exit at
+  //   once, which looks like "it did nothing at all".
   const interactive = !opts.prompt;
   if (interactive && !process.stdin.isTTY) {
     console.error("usage: hx [--root DIR] [--sandbox MODE] [--net deny|allow] [--read-path PATH]... \"your task\"");
-    console.error("       hx [--root DIR] ...                 # 不给任务且有终端时进入交互模式");
+    console.error("       hx [--root DIR] ...                 # with no task and a terminal, enters interactive mode");
     return 64;
   }
 
@@ -290,8 +305,10 @@ async function main(): Promise<number> {
       rules: preset(parsePreset(opts.approval)),
       ...(approvalHandler ? { approval: approvalHandler } : {}),
       compaction: {
-        // 必须与服务端的 n_ctx 对齐。设大了会被服务端截断（悄悄丢历史），
-        // 设小了会过早压缩、白白丢信息。llama.cpp 可从 /props 读到 n_ctx。
+        // Must match the server's n_ctx. Set it too high and the server
+        // truncates (silently dropping history); too low and compaction kicks
+        // in early, throwing information away for nothing. llama.cpp exposes
+        // n_ctx at /props.
         contextWindow: Number(process.env["HX_CONTEXT_WINDOW"] ?? 32768),
         reserveTokens: Number(process.env["HX_RESERVE_TOKENS"] ?? 4096),
         keepRecentTokens: Number(process.env["HX_KEEP_RECENT_TOKENS"] ?? 6144),

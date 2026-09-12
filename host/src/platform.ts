@@ -1,24 +1,28 @@
-// 宿主侧的平台差异，集中在这一个文件。
+// Host-side platform differences, concentrated in this one file.
 //
-// ★ 这里**不能**碰文件系统或起进程（test/arch.sh 会拦）。所以它只回答
-//   "形状"问题：引擎二进制该叫什么名字、命令交给哪个 shell、两个路径
-//   算不算在同一棵树下。真要落到磁盘上的动作一律走 hxp 交给引擎。
+// ★ This file **must not** touch the filesystem or start processes
+//   (test/arch.sh enforces it). So it only answers questions of "shape": what
+//   the engine binary is called, which shell a command is handed to, whether
+//   two paths sit in the same tree. Anything that actually reaches the disk
+//   goes over hxp to the engine.
 //
-//   node:process 与 node:path 是纯计算，不构成副作用，因此不在禁用之列。
+//   node:process and node:path are pure computation and constitute no side
+//   effect, so they are not on the forbidden list.
 import { platform } from "node:process";
 import { fileURLToPath } from "node:url";
 
 export const isWindows = platform === "win32";
 
 /**
- * 引擎二进制的默认路径。
+ * The engine binary's default path.
  *
- * ★ 两处坑都在这一行里：
- *   ① Windows 上要 .exe，否则 spawn 直接 ENOENT。
- *   ② 不能用 `new URL(...).pathname`。Windows 上它给出的是
- *      "/H:/myproject/hx/engine/build/hxd.exe" —— 多一个前导斜杠，
- *      spawn 同样 ENOENT，而报错信息看起来路径明明是对的。
- *      fileURLToPath 才是把 file: URL 还原成本地路径的正确做法。
+ * ★ Two traps live in this one line:
+ *   1. Windows needs .exe, or spawn fails with ENOENT immediately.
+ *   2. `new URL(...).pathname` cannot be used. On Windows it yields
+ *      "/H:/myproject/hx/engine/build/hxd.exe" -- one leading slash too many,
+ *      which is likewise ENOENT, while the error message makes the path look
+ *      perfectly correct. fileURLToPath is the right way to turn a file: URL
+ *      back into a local path.
  */
 export function defaultEnginePath(relDir: string, baseUrl: string): string {
   const dir = new URL(relDir, baseUrl);
@@ -26,37 +30,46 @@ export function defaultEnginePath(relDir: string, baseUrl: string): string {
 }
 
 /**
- * 把一条 shell 命令包成引擎能执行的 argv。
+ * Wrap a shell command into an argv the engine can execute.
  *
- * ★ Linux 侧用 `bash -c` 而不是 `bash -lc`：登录 shell 会读 ~/.profile，
- *   而 $HOME 在沙箱里不可读，于是每条命令都带一行 "Permission denied" 噪音。
+ * ★ Linux uses `bash -c` rather than `bash -lc`: a login shell reads
+ *   ~/.profile, and $HOME is unreadable inside the sandbox, so every command
+ *   would carry a line of "Permission denied" noise.
  *
- * ★ Windows 上默认 `cmd /c`。这不是随便挑的：
- *   PowerShell 启动要几百毫秒、会加载用户 profile（沙箱读不到），
- *   而 Git Bash 不一定装了 —— 而且宿主没有 fs，探测不了它在不在。
- *   需要别的 shell 就显式给 HX_SHELL，这比让宿主去猜要诚实。
+ * ★ Windows defaults to `cmd /c`. This is not an arbitrary pick:
+ *   PowerShell takes hundreds of milliseconds to start and loads the user
+ *   profile (which the sandbox cannot read), while Git Bash may not be
+ *   installed -- and the host has no fs, so it cannot probe for it.
+ *   Pass HX_SHELL explicitly for a different shell; that is more honest than
+ *   letting the host guess.
  */
 export function shellCommand(cmd: string, shellOverride?: string): string[] {
   const shell = shellOverride?.trim();
   if (shell) {
-    // "bash" / "pwsh" / "C:\\Program Files\\Git\\bin\\bash.exe" 都接受
+    // "bash" / "pwsh" / "C:\\Program Files\\Git\\bin\\bash.exe" all accepted
     const lower = shell.toLowerCase();
     if (lower.endsWith("cmd") || lower.endsWith("cmd.exe")) return [shell, "/c", cmd];
     if (lower.includes("powershell") || lower.includes("pwsh")) {
-      // ★ PowerShell 在沙箱里必须先挂一个 PSDrive，否则相对路径全指到 C:\。
+      // ★ PowerShell must mount a PSDrive first inside the sandbox, or every
+      //   relative path points at C:\.
       //
-      //   症状：进程 cwd 是对的（[Environment]::CurrentDirectory 没问题，
-      //   .NET 的相对路径也没问题），但 PowerShell 的 **provider location**
-      //   退回了 C:\ —— 于是 Get-ChildItem / Get-Content 这些 cmdlet 的
-      //   相对路径指向错误的地方。同一个进程里两套相对路径语义，极难查。
+      //   The symptom: the process cwd is correct
+      //   ([Environment]::CurrentDirectory is fine, and .NET relative paths are
+      //   fine too), but PowerShell's **provider location** falls back to C:\
+      //   -- so relative paths in cmdlets like Get-ChildItem / Get-Content aim
+      //   at the wrong place. Two sets of relative-path semantics in one
+      //   process, and extremely hard to diagnose.
       //
-      //   原因：PowerShell 切目录时要访问目标的**父目录**，而沙箱只授权了
-      //   工作区本身（父链不能授权 —— 在 C:\Users\<user> 上改 ACL 会触发
-      //   整个 profile 的继承重算，实测十分钟没回来）。
+      //   The cause: changing directory in PowerShell requires access to the
+      //   target's **parent**, while the sandbox grants only the workspace
+      //   itself (the ancestor chain cannot be granted -- changing the ACL on
+      //   C:\Users\<user> triggers an inheritance recomputation across the
+      //   entire profile; measured, ten minutes without returning).
       //
-      //   `Set-Location <绝对路径>` 同样失败（Access is denied）。
-      //   实测可行的是 New-PSDrive：它直接以工作区为 root 建一个驱动器，
-      //   不需要走父链。挂上之后 Set-Location hx: 就成立了。
+      //   `Set-Location <absolute path>` fails the same way (Access is denied).
+      //   What does work, measured, is New-PSDrive: it creates a drive rooted
+      //   directly at the workspace and never walks the ancestor chain. Once
+      //   mounted, Set-Location hx: succeeds.
       const fix =
         "New-PSDrive -Name hx -PSProvider FileSystem " +
         "-Root ([Environment]::CurrentDirectory) -Scope Global | Out-Null; " +
@@ -68,7 +81,8 @@ export function shellCommand(cmd: string, shellOverride?: string): string[] {
   return isWindows ? ["cmd", "/c", cmd] : ["bash", "-c", cmd];
 }
 
-/** 给模型看的 shell 名字。说错了，它会一直发另一种方言的命令。 */
+/** The shell's name as shown to the model. Get it wrong and it will keep
+ *  sending commands in the other dialect. */
 export function shellName(shellOverride?: string): string {
   const shell = shellOverride?.trim();
   if (shell) return shell;
@@ -76,20 +90,23 @@ export function shellName(shellOverride?: string): string {
 }
 
 /**
- * path 是否落在 root 之内（按路径分量边界判断）。
+ * Whether path lies inside root (judged on path-component boundaries).
  *
- * ★ Windows 上有两处非比不可的差异，漏掉任何一处都是**权限判断出错**，
- *   而不是"显示问题"：
- *     ① 分隔符可能是 '/' 也可能是 '\\'，同一个目录能写成两种样子
- *     ② NTFS 默认大小写不敏感，"C:\\Repo" 与 "c:\\repo" 是同一个目录
- *   按字节比的话，子 agent 只要把 root 换个大小写写一遍，
- *   intersect 就会认为那是一个"新的 root"而不是父 root 的子集。
+ * ★ Windows has two differences that are not optional; missing either is a
+ *   **permission decision going wrong**, not a display problem:
+ *     1. the separator may be '/' or '\\', so one directory has two spellings
+ *     2. NTFS is case-insensitive by default, so "C:\\Repo" and "c:\\repo" are
+ *        the same directory
+ *   Compare bytes and a subagent need only respell the root in a different
+ *   case for intersect to treat it as a "new root" rather than a subset of the
+ *   parent's.
  */
 export function pathWithin(path: string, root: string): boolean {
   const norm = (p: string): string => {
     let s = isWindows ? p.replace(/\//g, "\\") : p;
     if (isWindows) s = s.toLowerCase();
-    // 去掉尾部分隔符，让 "C:\\a\\" 与 "C:\\a" 等价（根目录 "C:\\" / "/" 除外）
+    // Drop trailing separators so "C:\\a\\" equals "C:\\a" (except for the
+    // roots "C:\\" and "/")
     while (s.length > 1 && (s.endsWith("/") || s.endsWith("\\"))) {
       if (isWindows && s.length === 3 && s[1] === ":") break;
       s = s.slice(0, -1);

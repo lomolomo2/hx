@@ -135,7 +135,7 @@ std::string Parent(const std::string& p) {
   return p.substr(0, slash);
 }
 
-// POSIX 文件系统大小写敏感，折叠是恒等变换。
+// POSIX filesystems are case-sensitive, so folding is the identity.
 std::string FoldCase(const std::string& p) { return p; }
 
 bool IsWithin(const std::string& path, const std::string& root) {
@@ -145,7 +145,7 @@ bool IsWithin(const std::string& path, const std::string& root) {
   return root == "/" || path[root.size()] == '/';
 }
 
-// ---- 文件 ----
+// ---- Files ----
 
 bool ReadWholeFile(const std::string& path, std::string* out, std::string* err) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -233,8 +233,9 @@ bool AppendFile::Open(const std::string& path, std::string* err) {
 
 bool AppendFile::WriteRecord(const std::string& s) {
   if (h_ == -1) return false;
-  // 一次 write() 追加：进程中途被杀也不会留下半行。
-  // 短写在常规文件上极罕见，但真发生了必须如实上报，不能假装成功。
+  // One appending write(): a process killed partway leaves no half line.
+  // Short writes are vanishingly rare on regular files, but if one does
+  // happen it must be reported honestly rather than papered over.
   const ssize_t n = ::write(static_cast<int>(h_), s.data(), s.size());
   return n >= 0 && static_cast<size_t>(n) == s.size();
 }

@@ -1,6 +1,6 @@
 import type { Tool } from "./types.js";
 
-/** 从补丁文本里抽出被改动的路径，用于策略匹配与预览。 */
+/** Extract the paths a patch touches, for policy matching and the preview. */
 function patchPaths(patch: string): string[] {
   const out: string[] = [];
   for (const line of patch.split("\n")) {

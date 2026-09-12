@@ -20,16 +20,19 @@ bool SetNonBlocking(int fd) {
 
 }  // namespace
 
-// POSIX 上 Fd 就是 fd，这一层几乎是恒等映射 —— 这正是想要的：
-// 原来的 Linux 行为一个字节都没变，Windows 才是需要伪装的那一边。
+// On POSIX an Fd really is an fd, so this layer is very nearly the identity --
+// which is exactly the intent: the original Linux behaviour changes not one
+// byte, and Windows is the side that has to do the disguising.
 static_assert(kStdin == STDIN_FILENO, "kStdin must equal STDIN_FILENO on POSIX");
 static_assert(kStdout == STDOUT_FILENO, "kStdout must equal STDOUT_FILENO on POSIX");
 
 bool InitStdio(std::string* err) {
-  // 宿主断开时写 stdout 会收到 SIGPIPE，默认动作是直接杀掉进程 ——
-  // 那样连"把积压丢掉、干净退出"的机会都没有。
+  // Writing to stdout after the host disconnects raises SIGPIPE, whose
+  // default action kills the process outright -- leaving no chance even to
+  // drop the backlog and exit cleanly.
   ::signal(SIGPIPE, SIG_IGN);
-  // stdout 必须非阻塞，否则读得慢的宿主能把整个单线程引擎冻住。
+  // stdout must be non-blocking, or a slow-reading host can freeze the whole
+  // single-threaded engine.
   if (!SetNonBlocking(STDOUT_FILENO)) {
     *err = std::string("fcntl(stdout, O_NONBLOCK): ") + ::strerror(errno);
     return false;
@@ -111,8 +114,9 @@ int Reactor::Wait(int timeout_ms, Event* out, int max, std::string* err) {
   }
   for (int i = 0; i < n; ++i) {
     out[i].fd = events[i].data.fd;
-    // EPOLLHUP/EPOLLERR 也当可读：让上层去 read 一次拿到 0 或错误，
-    // 收口逻辑只有一处，不在这里分叉。
+    // Treat EPOLLHUP/EPOLLERR as readable too: let the layer above do one
+    // read and get 0 or an error from it. The teardown logic lives in exactly
+    // one place; do not fork it here.
     out[i].readable = (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0;
     out[i].writable = (events[i].events & EPOLLOUT) != 0;
   }

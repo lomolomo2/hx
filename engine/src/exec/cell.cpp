@@ -5,8 +5,9 @@
 namespace hx {
 
 Cell::~Cell() {
-  // out_fd / err_fd 走 Engine::CloseCellFd（那里要同时摘掉 reactor 注册）；
-  // 到这里只剩可能还开着的 stdin 写端。
+  // out_fd / err_fd go through Engine::CloseCellFd (which also has to drop the
+  // reactor registration); all that can still be open by this point is the
+  // stdin write end.
   if (in_fd != io::kInvalid && in_fd != out_fd) io::Close(in_fd);
   ReleaseProc(&proc);
 }

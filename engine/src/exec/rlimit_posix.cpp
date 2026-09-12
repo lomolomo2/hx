@@ -20,7 +20,7 @@ bool SetOne(int resource, uint64_t value, const char* name, std::string* err) {
     *err = std::string("getrlimit(") + name + "): " + ::strerror(errno);
     return false;
   }
-  // 只收紧不放宽：硬上限本来更低时就照旧
+  // Only tighten, never loosen: if the hard limit is already lower, leave it
   const rlim_t want = static_cast<rlim_t>(value);
   if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) return true;
   rl.rlim_cur = want;
@@ -44,7 +44,7 @@ uint64_t CountUserTasks(unsigned uid) {
     char path[320];
     ::snprintf(path, sizeof(path), "/proc/%s/status", de->d_name);
     std::FILE* f = std::fopen(path, "r");
-    if (f == nullptr) continue;  // 进程可能刚退出
+    if (f == nullptr) continue;  // the process may have just exited
 
     char line[256];
     bool mine = false;
@@ -69,10 +69,12 @@ uint64_t CountUserTasks(unsigned uid) {
 Limits LimitsFor(uint64_t headroom) {
   Limits l;
   const uint64_t current = CountUserTasks(static_cast<unsigned>(::getuid()));
-  // 数不出来就不设上限：猜低了整个沙箱不可用，而 fork 炸弹还有
-  // timeout + kill(-pgid) 兜底。宁可少一道缓解，不可让工具全线失灵。
+  // If it cannot be counted, set no limit: guessing low makes the whole
+  // sandbox unusable, while a fork bomb still has the timeout plus
+  // kill(-pgid) as a backstop. Better one fewer mitigation than every tool
+  // broken.
   l.max_processes = current > 0 ? current + headroom : 0;
-  // 单个文件最大 2 GiB —— 防止 `yes > f` 之类把磁盘写满。
+  // 2 GiB per file -- stops things like `yes > f` filling the disk.
   l.max_file_bytes = 2ull * 1024 * 1024 * 1024;
   l.max_open_files = 4096;
   l.disable_core_dumps = true;
@@ -86,7 +88,7 @@ bool ApplyLimits(const Limits& l, std::string* err) {
     struct rlimit zero {};
     zero.rlim_cur = 0;
     zero.rlim_max = 0;
-    ::setrlimit(RLIMIT_CORE, &zero);  // 失败无所谓，core dump 只是噪音
+    ::setrlimit(RLIMIT_CORE, &zero);  // failure is fine; core dumps are just noise
   }
   if (!SetOne(RLIMIT_NPROC, l.max_processes, "RLIMIT_NPROC", err)) return false;
   if (!SetOne(RLIMIT_FSIZE, l.max_file_bytes, "RLIMIT_FSIZE", err)) return false;

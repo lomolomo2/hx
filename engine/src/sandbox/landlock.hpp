@@ -1,7 +1,8 @@
-// Landlock 是 Linux 上 Confinement 的实现。
+// Landlock is Confinement's implementation on Linux.
 //
-// 类型与契约都搬到了 sandbox/confine.hpp（跨平台）与 sandbox/confine_posix.hpp
-// （Linux 私有）。这个头文件只剩转发，免得所有 POSIX 侧的 include 都要改。
+// The types and the contract moved to sandbox/confine.hpp (cross-platform) and
+// sandbox/confine_posix.hpp (Linux-private). This header is now only a
+// forwarder, so that every include on the POSIX side did not have to change.
 #pragma once
 
 #include "sandbox/confine.hpp"

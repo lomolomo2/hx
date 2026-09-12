@@ -1,7 +1,8 @@
 import { truncateMiddle } from "../context/truncate.js";
 import type { Tool } from "./types.js";
 
-// 一个文件不该吃掉整个上下文窗口。超了就中段截断，并提示用 offset/limit 精读。
+// One file should not consume the whole context window. Past the cap, truncate
+// the middle and suggest using offset/limit to read precisely.
 const MAX_READ_CHARS = 24_000;
 
 export const readTool: Tool = {

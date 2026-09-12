@@ -1,7 +1,7 @@
 import type { Tool } from "./types.js";
 
-// 计划是工具，不是提示词里的自觉。
-// 实测 codex 的 update_plan 在 28 个会话里被调用了 79 次。
+// Planning is a tool, not something the prompt hopes for.
+// Measured against codex: update_plan was called 79 times across 28 sessions.
 export const todoTool: Tool = {
   name: "todo",
   description: "Record or update your plan. Call this when the task has multiple steps, and again as steps complete.",

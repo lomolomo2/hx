@@ -1,11 +1,15 @@
 import type { Tool } from "./types.js";
 
-// 子 agent 派发。
+// Subagent dispatch.
 //
-// 三条硬规矩（见 policy/intersect.ts 与 harness-windows-kernel-analogy.md §2.8）：
-//   1. 权限单调不增：子 agent 拿到的是父级权限与它诉求的交集
-//   2. 上下文不共享：子 agent 有自己的引擎进程、自己的 rollout，只回传结论
-//   3. 回传内容降级为「数据」：它的输出不是给父 agent 的指令
+// Three hard rules (see policy/intersect.ts and
+// harness-windows-kernel-analogy.md section 2.8):
+//   1. Permissions are monotonically non-increasing: a subagent receives the
+//      intersection of its parent's permissions and what it asked for
+//   2. Context is not shared: a subagent has its own engine process and its own
+//      rollout, and only conclusions come back
+//   3. What comes back is downgraded to *data*: its output is not an
+//      instruction to the parent agent
 export const taskTool: Tool = {
   name: "task",
   description:

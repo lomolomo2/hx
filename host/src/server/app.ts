@@ -1,7 +1,9 @@
-// HTTP + SSE 服务。
+// The HTTP + SSE service.
 //
-// ★ 事件直通：对外推送的就是 ThreadEvent 本身，服务层不再造一套 DTO。
-//   多一层映射意味着多一处会漂移的真相；前端要什么，就在 ThreadEvent 里加什么。
+// ★ Events pass straight through: what is pushed out is the ThreadEvent
+//   itself, and the service layer invents no parallel DTO. One more mapping
+//   layer is one more version of the truth that can drift; whatever the front
+//   end needs, add it to ThreadEvent.
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
@@ -76,7 +78,8 @@ export function createApp(opts: ServerOptions) {
       onEvent: (e) => publish(session, e),
       rules: preset(parsePreset(body.approval)),
       enginePath: opts.enginePath,
-      // 服务端的 ask 走 HTTP 回调：挂起，等 /approval/:id 回复
+      // Server-side ask goes through an HTTP callback: suspend and wait for a
+      // reply at /approval/:id
       approval: (req) =>
         new Promise<ApprovalDecision>((resolve) => {
           session.pending.set(req.id, { req, resolve });
@@ -100,7 +103,8 @@ export function createApp(opts: ServerOptions) {
     if (!s) return c.json({ error: "no such session" }, 404);
 
     return streamSSE(c, async (stream) => {
-      // 先补发已经发生过的事件，客户端晚连也不会漏
+      // Replay the events that already happened first, so a client connecting
+      // late misses nothing
       for (const e of s.events) await stream.writeSSE({ data: JSON.stringify(e), event: e.type });
 
       let alive = true;
@@ -124,7 +128,7 @@ export function createApp(opts: ServerOptions) {
         }
         await new Promise<void>((r) => {
           wake = r;
-          setTimeout(r, 15_000); // 心跳，顺便探活
+          setTimeout(r, 15_000); // heartbeat, which also probes liveness
         });
         if (alive && queue.length === 0) await stream.writeSSE({ data: "", event: "ping" });
       }
@@ -141,7 +145,7 @@ export function createApp(opts: ServerOptions) {
     if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
 
     s.busy = true;
-    // 异步跑：立刻返回，进展全部走 SSE
+    // Run asynchronously: return at once and report all progress over SSE
     void s.agent
       .run(parsed.data.text)
       .catch((e) => publish(s, { type: "error", message: (e as Error).message }))

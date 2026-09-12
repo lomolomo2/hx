@@ -1,7 +1,8 @@
-// 工具注册表。
+// The tool registry.
 //
-// ★ 循环里永远不出现任何工具名 —— 只有 registry.get(name).execute(...)。
-//   这是 SSDT 分派表的等价物：加工具不需要碰循环。
+// ★ No tool name ever appears in the loop -- only
+//   registry.get(name).execute(...). This is the equivalent of the SSDT
+//   dispatch table: adding a tool requires no change to the loop.
 import type { Tool } from "./types.js";
 import { bashTool } from "./bash.js";
 import { readTool } from "./read.js";
@@ -22,8 +23,9 @@ export class ToolRegistry {
     return this.#tools.get(name);
   }
 
-  /** 只暴露被允许的工具。被 deny 的工具不该出现在清单里 —— 省 token，
-   *  而且模型不会反复尝试一个注定被拒的动作（access mask 模型）。 */
+  /** Expose only permitted tools. A denied tool should not appear in the list
+   *  at all -- it saves tokens, and the model stops repeatedly attempting an
+   *  action destined to be refused (the access-mask model). */
   visible(allowed?: Set<string>): Tool[] {
     const all = [...this.#tools.values()];
     return allowed ? all.filter((t) => allowed.has(t.name)) : all;

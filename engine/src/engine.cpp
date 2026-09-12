@@ -20,12 +20,12 @@
 namespace hx {
 namespace {
 
-// 通配匹配：pat 中的 "**" 匹配零个或多个路径分量。
+// Glob matching: "**" in pat matches zero or more path components.
 bool MatchComponents(const std::vector<std::string>& pat, size_t pi,
                      const std::vector<std::string>& path, size_t si) {
   while (pi < pat.size()) {
     if (pat[pi] == "**") {
-      if (pi + 1 == pat.size()) return true;  // 结尾的 ** 吃掉剩余全部
+      if (pi + 1 == pat.size()) return true;  // a trailing ** swallows everything left
       for (size_t k = si; k <= path.size(); ++k) {
         if (MatchComponents(pat, pi + 1, path, k)) return true;
       }
@@ -40,11 +40,12 @@ bool MatchComponents(const std::vector<std::string>& pat, size_t pi,
 }
 
 std::vector<std::string> SplitComponents(const std::string& s) {
-  // ★ 两种分隔符都要认。
-  //   宿主写的 glob 一律是 '/'（协议是跨平台的），而引擎在 Windows 上
-  //   算出来的相对路径带的是 '\'。只按 '/' 切的话，Windows 上
-  //   "src/**/*.ts" 永远匹配不到任何东西 —— 而且是静默的零结果，
-  //   不会报错，最难查的那种。
+  // ★ Both separators have to be recognized.
+  //   Globs written by the host always use '/' (the protocol is
+  //   cross-platform), while the relative paths the engine computes on Windows
+  //   carry '\'. Splitting on '/' alone means "src/**/*.ts" never matches
+  //   anything on Windows -- and silently, as zero results with no error, the
+  //   hardest kind to track down.
   std::vector<std::string> out;
   size_t start = 0;
   for (size_t i = 0; i <= s.size(); ++i) {
@@ -61,13 +62,16 @@ std::vector<std::string> SplitComponents(const std::string& s) {
 Engine::Engine() : caps_(DetectCaps()) { RegisterOps(); }
 
 Engine::~Engine() {
-  // ruleset_ 与 reactor_ 自己管好自己的资源（前者是 shared_ptr，
-  // 后者有析构）。这里只剩会话私有 tmp —— 非空时删不掉，那是故意的：
-  // 留下痕迹比悄悄递归删除一个可能装着用户数据的目录安全得多。
+  // ruleset_ and reactor_ look after their own resources (the former is a
+  // shared_ptr, the latter has a destructor). All that is left here is the
+  // session-private tmp -- and failing to remove it when non-empty is
+  // deliberate: leaving a trace is far safer than quietly recursive-deleting a
+  // directory that may hold the user's data.
   if (!tmpdir_.empty()) platform::RemoveDir(tmpdir_);
 }
 
-// 出站队列上限。超过就开始丢事件 —— 丢事件比冻结引擎好得多。
+// Outbound queue cap. Past it, events start being dropped -- dropping events
+// is far better than freezing the engine.
 static constexpr size_t kOutSoftCap = 8u * 1024u * 1024u;
 
 void Engine::Send(std::string line, bool droppable) {
@@ -87,11 +91,13 @@ void Engine::FlushOut() {
       continue;
     }
     if (n == io::kWouldBlock) {
-      // 写不动了：挂上「关注可写」，等可写再继续，绝不在这里等
+      // Cannot write any more: turn on "watch for writable" and continue when
+      // it is, never wait here
       if (!out_watched_ && reactor_.WatchWrite(io::kStdout, true)) out_watched_ = true;
       return;
     }
-    // stdout 断了：宿主没了，丢弃积压，循环会在 stdin EOF 时退出
+    // stdout broke: the host is gone. Drop the backlog; the loop exits at
+    // stdin EOF
     out_buf_.clear();
     break;
   }
@@ -148,9 +154,11 @@ json Engine::EffectiveJson() const {
               {"tmpdir", tmpdir_},
               {"enforced", ruleset_.enforced},
               {"net_enforced", ruleset_.net_enforced},
-              // ★ 不再露出 landlock_abi 这种平台专有的数字。
-              //   宿主要判断的是「这次有没有真沙箱」，不是「用的哪套内核接口」；
-              //   后者在 caps 里有完整记录（session_meta 第一条就写了）。
+              // ★ No longer exposes a platform-specific number like
+              //   landlock_abi. What the host needs to decide is "was there a
+              //   real sandbox this time", not "which kernel interface was
+              //   used"; the latter is fully recorded in caps (written in the
+              //   very first session_meta record).
               {"backend", caps_.landlock_abi > 0 ? "landlock"
                           : caps_.appcontainer  ? "appcontainer"
                                                 : "none"}};
@@ -204,7 +212,8 @@ std::optional<json> Engine::OpSessionOpen(const Request& r) {
       const std::string raw = v.get<std::string>();
       std::string resolved;
       if (!platform::RealPath(raw, &resolved)) {
-        // 不存在就跳过并如实记录，不因此让整个会话开不起来
+        // Non-existent: skip it and record it honestly rather than letting it
+        // stop the whole session from opening
         p.extra_read_paths.push_back(raw);
         continue;
       }
@@ -212,23 +221,25 @@ std::optional<json> Engine::OpSessionOpen(const Request& r) {
     }
   }
 
-  // 会话私有 tmp：放在 workspace 外，避免污染仓库，但显式授予写权限
+  // The session-private tmp: outside the workspace so it does not pollute the
+  // repo, but explicitly granted write access
   std::string tmperr;
   if (!platform::MakeTempDir("hx-sess-", &p.tmpdir, &tmperr)) {
     return MakeError(r.id, err::kInternal, tmperr);
   }
 
-  // ★ 旧的 ruleset 由 shared_ptr 自己回收 —— 但回收的时机有语义：
-  //   Windows 上 Confinement 析构会撤掉打在 roots 上的 ACE 并删掉
-  //   AppContainer profile。所以这里必须先赋值再让旧的析构，
-  //   顺序反了会把新会话刚打好的 ACE 一起撤掉（同一个 root，不同 SID，
-  //   但 profile 删除是按名字的）。
+  // ★ The old ruleset is reclaimed by its shared_ptr -- but *when* it is
+  //   reclaimed carries meaning: on Windows, destroying a Confinement revokes
+  //   the ACEs stamped on the roots and deletes the AppContainer profile. So
+  //   the assignment has to happen before the old one is destroyed; reversed,
+  //   it would revoke the ACEs the new session has just stamped (same root,
+  //   different SID, but profile deletion goes by name).
   ruleset_ = BuildConfinement(p, caps_);
   policy_ = std::move(p);
   tmpdir_ = policy_.tmpdir;
   session_open_ = true;
 
-  // rollout：路径由引擎决定，宿主只能给受校验的名字
+  // rollout: the engine decides the path; the host may only supply a validated name
   std::string name = "s" + std::to_string(platform::Pid());
   if (auto it = r.args.find("name"); it != r.args.end() && it->is_string()) {
     name = it->get<std::string>();
@@ -241,7 +252,7 @@ std::optional<json> Engine::OpSessionOpen(const Request& r) {
     return MakeError(r.id, err::kInternal, "rollout: " + rerr);
   }
   session_id_ = name;
-  // 第一条记录就把"这次到底有没有真沙箱"钉死在日志里
+  // The very first record nails "did this run have a real sandbox" into the log
   rollout_.Append(json{{"type", "session_meta"},
                        {"payload", json{{"session", session_id_},
                                         {"caps", CapsToJson(caps_)},
@@ -285,7 +296,8 @@ std::optional<json> Engine::OpPolicySet(const Request& r) {
   policy_ = std::move(next);
 
   json result{{"effective", EffectiveJson()}};
-  // 诚实说明：已经在跑的 cell 带的是旧 ruleset，内核层无法追溯收紧
+  // Stated honestly: cells already running carry the old ruleset, and the
+  // kernel layer cannot tighten retroactively
   if (!cells_.all().empty()) {
     result["note"] = "already-running cells keep the ruleset they were started with";
   }
@@ -368,8 +380,9 @@ std::optional<json> Engine::OpExecStart(const Request& r) {
     c = cells_.Create(cells_.NextId());
     c->is_pty = true;
     c->proc = sp.proc;
-    // ★ 别写成 in_fd = out_fd。Linux 上两者确实是同一个 fd，
-    //   ConPTY 却是两条独立管道 —— 见 PtySpawnResult 的注释。
+    // ★ Do not write in_fd = out_fd. On Linux the two really are the same fd,
+    //   but ConPTY uses two independent pipes -- see the comments on
+    //   PtySpawnResult.
     c->out_fd = sp.master_out;
     c->in_fd = sp.master_in;
   } else {
@@ -421,12 +434,13 @@ std::optional<json> Engine::OpExecStdin(const Request& r) {
   size_t off = 0;
   while (off < data.size()) {
     const long n = io::Write(c->in_fd, data.data() + off, data.size() - off);
-    if (n == io::kWouldBlock) break;  // 缓冲满，如实回报写了多少
+    if (n == io::kWouldBlock) break;  // buffer full; report honestly how much went out
     if (n == io::kIoError) return MakeError(r.id, err::kInternal, "write to cell stdin failed");
     off += static_cast<size_t>(n);
   }
 
-  // 可选地关闭 stdin（管道版用来给 `cat` 之类送 EOF）
+  // Optionally close stdin (the pipe flavour uses this to send EOF to things
+  // like `cat`)
   if (r.args.value("close", false) && !c->is_pty) {
     io::Close(c->in_fd);
     c->in_fd = io::kInvalid;
@@ -454,7 +468,8 @@ std::optional<json> Engine::OpExecWait(const Request& r) {
     max_bytes = it->get<size_t>();
   }
 
-  // 有数据或已结束 → 立即答复；否则挂起到 yield_ms（KeWaitForSingleObject 带超时）
+  // Data available or already finished -> answer at once; otherwise suspend
+  // until yield_ms (KeWaitForSingleObject with a timeout)
   if (!c->buf.empty() || c->Finished()) {
     return BuildWaitReply(r.id, c, max_bytes);
   }
@@ -487,7 +502,7 @@ json Engine::BuildWaitReply(const std::string& req_id, Cell* c, size_t max_bytes
   }
 
   json reply = MakeOk(req_id, std::move(result));
-  if (done && c->buf.empty()) cells_.Erase(c->id);  // 取完即回收
+  if (done && c->buf.empty()) cells_.Erase(c->id);  // fully drained, so reap it
   return reply;
 }
 
@@ -511,17 +526,20 @@ std::optional<json> Engine::OpExecKill(const Request& r) {
     return MakeError(r.id, err::kBadArgs, "unsupported signal: " + signame);
   }
 
-  // 信号打的是整棵子树，不是单个进程。
-  // KILL 走「收掉整组」那条路，否则杀不干净会 fork 的目标。
+  // Signals target the whole subtree, not a single process.
+  // KILL takes the "collect the entire group" path, or a target that forks
+  // never gets cleaned up.
   bool killed = false;
   if (c->proc.valid()) {
     if (sig == Sig::kKill) {
       ScheduleKill(c->proc);
       killed = true;
     } else {
-      // ★ 送不到就如实返回 false，绝不悄悄升级成强杀。
-      //   Windows 上只有控制台程序会响应 CTRL_BREAK（见 proc_win.cpp），
-      //   把「优雅终止」偷换成「强杀」会让调用方以为进程有机会清理，而它没有。
+      // ★ Undeliverable returns false honestly and never silently escalates to
+      //   a hard kill. On Windows only console programs respond to CTRL_BREAK
+      //   (see proc_win.cpp), and substituting a hard kill for a graceful
+      //   termination would let the caller believe the process had a chance to
+      //   clean up when it did not.
       killed = SignalGroup(c->proc, sig);
     }
   }
@@ -530,8 +548,9 @@ std::optional<json> Engine::OpExecKill(const Request& r) {
 
 // ------------------------------------------------------------------ fs
 //
-// ★ 注意：hxd 自己不在沙箱里（它就是"内核"），所以 Landlock 拦不住这些 op。
-//   path_guard 是唯一阻止宿主用 fs.read 读走 /etc/shadow 的东西。
+// ★ Note that hxd itself is not inside the sandbox (it *is* the "kernel"), so
+//   Landlock stops none of these ops. path_guard is the only thing preventing
+//   the host from reading /etc/shadow through fs.read.
 
 std::optional<json> Engine::OpFsRead(const Request& r) {
   json err;
@@ -639,8 +658,10 @@ std::optional<json> Engine::OpFsStat(const Request& r) {
   return MakeOk(r.id, json{{"exists", true},
                            {"kind", kind},
                            {"size", st.size},
-                           // Windows 没有 POSIX 权限位，这里是合成值（见 platform::Stat）。
-                           // 协议里它只用于展示，不参与任何决策。
+                           // Windows has no POSIX permission bits, so this is a
+                           // synthesized value (see platform::Stat). In the
+                           // protocol it is display-only and feeds into no
+                           // decision.
                            {"mode", st.mode},
                            {"mtime_ms", st.mtime_ms}});
 }
@@ -658,10 +679,12 @@ std::optional<json> Engine::OpFsGlob(const Request& r) {
     limit = it->get<size_t>();
   }
 
-  // 按路径分量匹配。用整串 fnmatch 有两种都错的选法：
-  //   不带 FNM_PATHNAME —— "*.txt" 会匹配到子目录里的文件
-  //   带  FNM_PATHNAME —— "**" 失去"零个或多个目录"的含义
-  // 所以分量级匹配才是对的：'**' 吃掉任意多层，其余分量各自 fnmatch。
+  // Match per path component. Running fnmatch over the whole string offers two
+  // choices, both wrong:
+  //   without FNM_PATHNAME -- "*.txt" matches files inside subdirectories
+  //   with    FNM_PATHNAME -- "**" loses its "zero or more directories" meaning
+  // So component-level matching is the right answer: '**' swallows any number
+  // of levels and every other component gets its own fnmatch.
   const std::vector<std::string> pat_parts = SplitComponents(pattern);
   json matches = json::array();
   bool truncated = false;
@@ -672,7 +695,8 @@ std::optional<json> Engine::OpFsGlob(const Request& r) {
     const std::string dir = stack.back();
     stack.pop_back();
     std::vector<std::string> names;
-    // 读不动的目录直接跳过：一个权限不足的子目录不该让整个 glob 失败。
+    // Skip directories that cannot be read: one subdirectory with insufficient
+    // permissions should not fail the entire glob.
     if (!platform::ListDir(dir, &names)) continue;
     for (const auto& name : names) {
       const std::string full = platform::Join(dir, name);
@@ -685,8 +709,9 @@ std::optional<json> Engine::OpFsGlob(const Request& r) {
       }
       if (MatchComponents(pat_parts, 0, SplitComponents(rel), 0)) {
         if (matches.size() >= limit) { truncated = true; break; }
-        // ★ 回给宿主的一律用 '/'。协议是跨平台的，宿主（以及模型）
-        //   拿到的路径不该因为引擎跑在哪个系统上而变形。
+        // ★ Everything returned to the host uses '/'. The protocol is
+        //   cross-platform, and the paths the host (and the model) receive
+        //   should not change shape depending on which OS the engine runs on.
         std::string norm = rel;
         for (char& ch : norm) {
           if (platform::IsSeparator(ch)) ch = '/';
@@ -718,7 +743,7 @@ std::optional<json> Engine::OpLogFlush(const Request& r) {
   return MakeOk(r.id, json{{"flushed", rollout_.Flush()}});
 }
 
-// ------------------------------------------------------------------ 循环
+// ------------------------------------------------------------------ the loop
 
 void Engine::OnLine(std::string_view line) {
   if (line.empty()) return;
@@ -739,7 +764,7 @@ void Engine::OnLine(std::string_view line) {
     return;
   }
   std::optional<json> reply = it->second(req);
-  if (reply.has_value()) Reply(*reply);  // nullopt = 延后答复
+  if (reply.has_value()) Reply(*reply);  // nullopt = answer later
 }
 
 int Engine::ComputeTimeoutMs() const {
@@ -755,7 +780,7 @@ int Engine::ComputeTimeoutMs() const {
     if (c->exited && (c->out_fd != io::kInvalid || c->err_fd != io::kInvalid)) {
       consider(c->fd_close_deadline_ms != 0 ? c->fd_close_deadline_ms : NowMs() + 50);
     }
-    // 管道已 EOF 但还没 reap：短轮询等子进程退出
+    // Pipes at EOF but not reaped yet: poll briefly for the child to exit
     if (!c->exited && c->out_fd == io::kInvalid && c->err_fd == io::kInvalid) {
       consider(NowMs() + 20);
     }
@@ -767,11 +792,12 @@ int Engine::ComputeTimeoutMs() const {
 
 void Engine::CloseCellFd(Cell* c, io::Fd fd) {
   reactor_.Del(fd);
-  // ★ 先摘引用再关。
-  //   Linux 的 pty 主端读写是同一个 fd，in_fd 与 out_fd 会指向同一个东西，
-  //   不先置空就会二次关闭。ConPTY 那边是两条独立管道，这一行不触发 ——
-  //   两种情况用同一段代码是对的，因为判断条件问的是「是不是同一个」，
-  //   而不是「是不是 pty」。
+  // ★ Drop the reference before closing.
+  //   On Linux the pty master is read and written through one fd, so in_fd and
+  //   out_fd point at the same thing and failing to null it first causes a
+  //   double close. On ConPTY they are two independent pipes and this line does
+  //   not fire -- one piece of code covering both is correct, because the
+  //   condition asks "is it the same one", not "is it a pty".
   if (c->in_fd == fd) c->in_fd = io::kInvalid;
   io::Close(fd);
   if (c->out_fd == fd) c->out_fd = io::kInvalid;
@@ -787,11 +813,13 @@ void Engine::OnCellFdReadable(io::Fd fd) {
   }
   const char* stream = c->is_pty ? "pty" : (fd == c->out_fd ? "stdout" : "stderr");
 
-  // ★ 每次事件最多读这么多轮就让出去。
-  //   原来是个无界 while(true)：只要子进程产出的速度超过我们读的速度，
-  //   这个函数就永不返回，于是 EnforceDeadlines/ReapChildren 全被饿死 ——
-  //   fork 炸弹因此杀不掉，超时也不生效。Reactor 保证水平触发语义
-  //   （见 io.hpp），让出去之后下一轮自然会再被叫回来。
+  // ★ At most this many rounds per event, then yield.
+  //   This used to be an unbounded while(true): as long as the child produced
+  //   output faster than we read it, this function never returned, and
+  //   EnforceDeadlines/ReapChildren starved -- so a fork bomb could not be
+  //   killed and timeouts did not fire. The Reactor guarantees
+  //   level-triggered semantics (see io.hpp), so after yielding we are
+  //   naturally called back on the next round.
   constexpr int kMaxChunksPerEvent = 8;
 
   char buf[65536];
@@ -800,7 +828,8 @@ void Engine::OnCellFdReadable(io::Fd fd) {
     if (n > 0) {
       const size_t before = c->dropped;
       c->Append(buf, static_cast<size_t>(n));
-      // 缓冲已满时不再往事件流里灌 —— 否则失控的输出会连宿主一起冲垮
+      // Stop feeding the event stream once the buffer is full -- otherwise
+      // runaway output swamps the host as well
       if (c->dropped == before) {
         Emit(MakeEvent("exec.output",
                        json{{"cell", c->id},
@@ -828,15 +857,19 @@ void Engine::ReapChildren() {
     c->exited = true;
     c->exit_code = code;
     c->term_signal = sig;
-    // ★ cell 拥有它的进程组：直接子进程退了，组里若还有成员，必须收掉。
+    // ★ A cell owns its process group: once the direct child exits, anything
+    //   still in the group must be collected.
     //
-    //   `bash -c ':(){ :|:& };:'` 的顶层 bash 会立刻正常退出（exit_code=0），
-    //   把子孙留成孤儿。超时分支因为 c->exited 已为真而不会触发，于是那些进程
-    //   永远没人管。这不只是 fork 炸弹的问题 —— 任何 `cmd &` / 启后台服务的
-    //   命令都会这样漏出去。
+    //   The top-level bash of `bash -c ':(){ :|:& };:'` exits normally and
+    //   immediately (exit_code=0), leaving its descendants orphaned. The
+    //   timeout branch does not fire because c->exited is already true, so
+    //   nothing ever looks after those processes. And this is not only a fork
+    //   bomb problem -- any `cmd &` or command that starts a background
+    //   service leaks the same way.
     //
-    //   ★ 问的是 GroupAlive（整棵子树里还有没有活的），不是「直接子进程还在吗」。
-    //     Windows 上这是 Job 的 ActiveProcesses，Linux 上是 kill(-pgid, 0)。
+    //   ★ The question is GroupAlive (is anything in the subtree still alive),
+    //     not "is the direct child still there". On Windows that is the Job's
+    //     ActiveProcesses; on Linux it is kill(-pgid, 0).
     bool orphans = false;
     if (GroupAlive(c->proc)) {
       orphans = true;
@@ -853,10 +886,11 @@ void Engine::ReapChildren() {
 void Engine::ScheduleKill(const Proc& p) {
   if (!p.valid()) return;
   FreezeAndKillGroup(p);
-  // ★ 要不要排清扫，由平台说了算（见 DupGroupForSweep）：
-  //   Linux 要 —— SIGKILL 和 fork 在赛跑，而且 cell 马上会被 exec.wait 回收，
-  //               清理必须活得比它久。
-  //   Windows 不要 —— TerminateJobObject 是原子的，没有幸存者可扫。
+  // ★ Whether to queue a sweep is the platform's call (see DupGroupForSweep):
+  //   Linux does -- SIGKILL races fork, and the cell is about to be reaped by
+  //                 exec.wait, so cleanup has to outlive it.
+  //   Windows does not -- TerminateJobObject is atomic and there are no
+  //                 survivors to sweep.
   Proc dup;
   if (DupGroupForSweep(p, &dup)) {
     pending_kills_.push_back(PendingKill{dup, 12, NowMs() + 150});
@@ -870,7 +904,7 @@ void Engine::SweepKills() {
       ++it;
       continue;
     }
-    // 组空了就收工
+    // The group is empty, so we are done
     if (!GroupAlive(it->proc)) {
       ReleaseProc(&it->proc);
       it = pending_kills_.erase(it);
@@ -878,7 +912,8 @@ void Engine::SweepKills() {
     }
     FreezeAndKillGroup(it->proc);
     if (--it->sweeps_left <= 0) {
-      // 扫了这么多轮还在，如实上报，不假装干净了
+      // Still there after that many sweeps: report it honestly rather than
+      // pretending things are clean
       Emit(MakeEvent("engine.warning",
                      json{{"message", "process group survived cleanup sweeps"},
                           {"detail", json{{"pgid", it->proc.pid}}}}));
@@ -894,17 +929,18 @@ void Engine::SweepKills() {
 void Engine::EnforceDeadlines() {
   const int64_t now = NowMs();
   for (auto& [id, c] : cells_.all()) {
-    // ① 超时：开始清扫
+    // 1. Timeout: start cleaning up
     if (!c->exited && c->kill_deadline_ms != 0 && now >= c->kill_deadline_ms) {
       c->killed_by_timeout = true;
       c->kill_deadline_ms = 0;
       ScheduleKill(c->proc);
     }
 
-    // ③ 收口：直接子进程已退出，但 fd 还被孙进程占着 —— EOF 不会来了
+    // 3. Teardown: the direct child has exited but the fds are still held by
+    //    grandchildren -- EOF is never coming
     if (c->exited && (c->out_fd != io::kInvalid || c->err_fd != io::kInvalid)) {
       if (c->fd_close_deadline_ms == 0) {
-        c->fd_close_deadline_ms = now + 300;  // 先把缓冲里的输出读干净
+        c->fd_close_deadline_ms = now + 300;  // drain the buffered output first
       } else if (now >= c->fd_close_deadline_ms) {
         if (c->out_fd != io::kInvalid) CloseCellFd(c.get(), c->out_fd);
         if (c->err_fd != io::kInvalid) CloseCellFd(c.get(), c->err_fd);
@@ -933,8 +969,10 @@ void Engine::ServicePendingWaits() {
 
 int Engine::Run() {
   std::string err;
-  // stdio 先接管：宿主断开时不能被信号杀掉，stdout 也必须非阻塞
-  // （否则读得慢的宿主能把整个单线程引擎冻住，见 Engine::Send 的注释）。
+  // Take over stdio first: a disconnecting host must not kill us with a
+  // signal, and stdout has to be non-blocking (otherwise a slow-reading host
+  // can freeze the whole single-threaded engine; see the comments on
+  // Engine::Send).
   if (!io::InitStdio(&err)) {
     ::fprintf(stderr, "hxd: stdio: %s\n", err.c_str());
     return 1;
@@ -980,8 +1018,9 @@ int Engine::Run() {
         if (got > 0) {
           reader.Feed(std::string_view(buf, static_cast<size_t>(got)), on_line, on_oversize);
         } else if (got == 0 || got == io::kIoError) {
-          // 宿主关掉了 stdin（或它没了）。不立刻退出：还没答复的请求
-          // 与还在跑的 cell 必须先收尾，见循环末尾的判断。
+          // The host closed stdin (or is gone). Do not exit immediately:
+          // unanswered requests and running cells have to be wound up first;
+          // see the check at the end of the loop.
           stdin_open = false;
           reactor_.Del(io::kStdin);
         }
@@ -996,7 +1035,7 @@ int Engine::Run() {
     ServicePendingWaits();
     FlushOut();
 
-    // stdin 关闭且没有待答复的请求、没有活着的 cell → 干净退出
+    // stdin closed, no requests awaiting an answer, no live cells -> exit cleanly
     if (!stdin_open && waits_.empty() && pending_kills_.empty()) {
       bool any_alive = false;
       for (auto& [id, c] : cells_.all()) {

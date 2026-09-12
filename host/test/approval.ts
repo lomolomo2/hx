@@ -1,4 +1,5 @@
-// M6 判据：ask 能挂起并恢复；deny 的结果要喂回模型；allow_always 之后不再打扰。
+// The M6 criterion: ask suspends and resumes; a deny is fed back to the
+// model; allow_always stops bothering the user afterwards.
 import { EngineClient } from "../src/engine/client.js";
 import { Agent } from "../src/loop/turn.js";
 import { ScriptedModelClient, callTool, say } from "../src/model/scripted.js";
@@ -22,24 +23,24 @@ const check = (name: string, cond: boolean, detail = ""): void => {
   if (!cond) failures++;
 };
 
-// ---------------- 纯函数部分（不需要引擎） ----------------
-console.log("规则引擎");
-check("通配匹配", wildcardMatch("*rm -rf *", "cd x && rm -rf build"));
-check("非匹配不误伤", !wildcardMatch("*rm -rf *", "ls -la"));
-check("后匹配者胜", evaluate("bash", "git push", [
+// ---------------- the pure-function part (no engine needed) ----------------
+console.log("rule engine");
+check("wildcard matching", wildcardMatch("*rm -rf *", "cd x && rm -rf build"));
+check("a non-match does not fire", !wildcardMatch("*rm -rf *", "ls -la"));
+check("last match wins", evaluate("bash", "git push", [
   { permission: "bash", pattern: "*", action: "deny" },
   { permission: "bash", pattern: "git*", action: "allow" },
 ]) === "allow");
-check("多主体取最严", evaluateAll("apply_patch", ["a.ts", "b.ts"], [
+check("multiple subjects take the strictest", evaluateAll("apply_patch", ["a.ts", "b.ts"], [
   { permission: "apply_patch", pattern: "*", action: "allow" },
   { permission: "apply_patch", pattern: "b.ts", action: "deny" },
 ]) === "deny");
-check("无差别 deny 的工具被隐藏",
+check("a blanket-denied tool is hidden",
   !visibleToolNames(["bash", "read"], [{ permission: "bash", pattern: "*", action: "deny" }]).has("bash"));
-check("仅部分模式被禁的工具仍可见",
+check("a tool denied for only some patterns stays visible",
   visibleToolNames(["bash"], [{ permission: "bash", pattern: "*rm -rf*", action: "deny" }]).has("bash"));
 
-// ---------------- 端到端：ask / deny / allow_always ----------------
+// ---------------- end to end: ask / deny / allow_always ----------------
 const asked: ApprovalRequest[] = [];
 let decision: ApprovalDecision = "deny";
 
@@ -66,27 +67,27 @@ const agent = new Agent(engine, new ScriptedModelClient(script), new ToolRegistr
 
 await agent.open({ roots: [ws], sandbox: "workspace-write", net: "deny", name: "approval" });
 
-console.log("\n审批回路");
+console.log("\napproval loop");
 decision = "deny";
 const r1 = await agent.run("remove the build dir");
 
 const denied = agent.history.filter((m) => m.role === "tool" && (m.content ?? "").includes("did not approve"));
-check("高危命令触发了询问", asked.length >= 1, `asked=${asked.length}`);
-check("预览里是命令原文", asked[0]?.preview.includes("rm -rf build") === true, asked[0]?.preview ?? "");
-check("拒绝结果被喂回模型", denied.length >= 1, `denied=${denied.length}`);
-check("拒绝后循环继续而不是抛异常", r1.stoppedBecause === "final_message", r1.stoppedBecause);
-check("安全命令没有被询问", asked.every((a) => a.preview.includes("rm -rf")), asked.map((a) => a.preview).join(" | "));
-check("有 approval.requested 事件", events.some((e) => e.type === "approval.requested"));
-check("有 approval.resolved 事件", events.some((e) => e.type === "approval.resolved"));
+check("a dangerous command triggered a question", asked.length >= 1, `asked=${asked.length}`);
+check("the preview holds the command verbatim", asked[0]?.preview.includes("rm -rf build") === true, asked[0]?.preview ?? "");
+check("the denial was fed back to the model", denied.length >= 1, `denied=${denied.length}`);
+check("after a denial the loop continues rather than throwing", r1.stoppedBecause === "final_message", r1.stoppedBecause);
+check("safe commands were not asked about", asked.every((a) => a.preview.includes("rm -rf")), asked.map((a) => a.preview).join(" | "));
+check("an approval.requested event was emitted", events.some((e) => e.type === "approval.requested"));
+check("an approval.resolved event was emitted", events.some((e) => e.type === "approval.resolved"));
 
-// allow_always：第二次同样的命令不该再问
+// allow_always: the same command a second time must not ask again
 const asksBefore = asked.length;
 decision = "allow_always";
 step = 0;
 await agent.run("try again, you may remove it");
 const newAsks = asked.length - asksBefore;
-check("allow_always 之后同样的调用不再询问", newAsks === 1, `本轮询问了 ${newAsks} 次`);
-check("会话规则里留下了授权", agent.rules.some((r) => r.action === "allow" && r.pattern === "rm -rf build"));
+check("after allow_always the same call is not asked again", newAsks === 1, `asked ${newAsks} time(s) this turn`);
+check("the grant was left in the session rules", agent.rules.some((r) => r.action === "allow" && r.pattern === "rm -rf build"));
 
 console.log(`\nfailures=${failures}`);
 engine.close();

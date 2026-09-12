@@ -1,47 +1,66 @@
 # hx
 
-一个带 OS 级沙箱的 agent harness。引擎是原生二进制，宿主是 TypeScript。
+*English · [中文](README.zh-CN.md)*
+
+An agent harness with an OS-level sandbox. The engine is a native binary; the
+host is TypeScript.
 
 ```
-LLM（不可信，高频产生意图）
-  ↓ 工具调用 —— 唯一入口
-hx-host  (TypeScript)   决定「该不该做」：上下文装配、提示词、策略、编排
-  ↓ hxp/0 —— JSONL over stdio，唯一入口
-hxd      (C++)          决定「能不能做」：Landlock / seccomp / rlimit / exec / 补丁 / 日志
+LLM (untrusted, generates intent at high volume)
+  ↓ tool calls -- the only entry point
+hx-host  (TypeScript)   decides what SHOULD be done: context assembly, prompts, policy, orchestration
+  ↓ hxp/0 -- JSONL over stdio, the only entry point
+hxd      (C++)          decides what CAN be done: Landlock / seccomp / rlimit / exec / patches / logs
   ↓
-真实世界
+the real world
 ```
 
-**核心约束**：`hx-host` 不允许 `import node:fs` 或 `node:child_process`（`test/arch.sh` 强制）。
-所有副作用必须过引擎。这样"宿主相对引擎就是用户态"不是一句口号，而是架构事实。
+**The core constraint**: `hx-host` may not `import node:fs` or
+`node:child_process` (enforced by `test/arch.sh`). Every side effect must pass
+through the engine. That is what makes "the host is userland relative to the
+engine" an architectural fact rather than a slogan.
 
-本项目的设计不是凭空来的，四条主线写在代码注释里，这里先给结论：
+This design did not come out of nowhere. Four threads run through the code
+comments; here are the conclusions up front:
 
-- **底座调研**：对比 codex（深：沙箱/审批/补丁）、pi（白盒 runtime 库）、opencode（harness 即服务）、DeerFlow 2.0（lead agent + subagent）之后，选择「原生引擎 + TS 宿主」的双进程特权分离。
-- **特权边界**：整套安全模型对照 Windows 的 user/kernel 分界——syscall 唯一入口、参数捕获、HANDLE 不透明 ID、access mask、IRP 可拦截、IRQL 阶段约束、UIPI 完整性级别。每条对应关系都在相关源文件的注释里。
-- **调度模型**：turn 循环对照 Win32 消息循环（无状态 WndProc = 无状态模型、WM_PAINT 合并 = 上下文压缩）。
-- **实施顺序**：先协议后实现；先最小闭环再加工程属性；地基（两条流、append-only 事实来源、完整状态快照）必须 Day 1 定死。
+- **Survey of the ground**: after comparing codex (deep: sandbox / approval /
+  patches), pi (a white-box runtime library), opencode (harness as a service)
+  and DeerFlow 2.0 (lead agent + subagents), the choice was a two-process
+  privilege separation: a native engine plus a TypeScript host.
+- **The privilege boundary**: the whole security model is mapped against
+  Windows's user/kernel divide -- a single syscall entry point, parameter
+  capture, HANDLEs as opaque IDs, access masks, interceptable IRPs, IRQL phase
+  constraints, UIPI integrity levels. Each correspondence is documented in the
+  comments of the relevant source file.
+- **The scheduling model**: the turn loop is mapped against the Win32 message
+  loop (a stateless WndProc = a stateless model; WM_PAINT coalescing = context
+  compaction).
+- **Order of implementation**: protocol before implementation; a minimal closed
+  loop before engineering properties; and the foundations (two streams, an
+  append-only source of truth, complete state snapshots) fixed on day one.
 
 ---
 
-## 快速开始
+## Quick start
 
-### 构建引擎
+### Build the engine
 
 ```bash
 cd engine
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j8
-./build/hxd --self-test          # 打印本机隔离能力，退出码 0 = 有真沙箱
+./build/hxd --self-test          # prints this machine's isolation capabilities; exit code 0 = a real sandbox
 ```
 
-Linux 与 Windows。`--self-test` 的退出码在两个平台上是同一个意思：
-**0 = 这台机器上有真沙箱，2 = 没有**。没有时引擎会如实上报"无文件系统隔离"
-而不是假装安全。
+Linux and Windows. `--self-test`'s exit code means the same thing on both
+platforms: **0 = this machine has a real sandbox, 2 = it does not**. When it
+does not, the engine reports "no filesystem isolation" honestly rather than
+pretending to be safe.
 
-- **Linux** 需要内核启用 Landlock（`cat /sys/kernel/security/lsm` 里应有 `landlock`）。
-- **Windows** 需要 Windows 10 1809 或更新（AppContainer + ConPTY）。
-  用 MSVC 构建（VS2019 16.11 起，需 `/std:c++20`）：
+- **Linux** needs Landlock enabled in the kernel (`landlock` should appear in
+  `cat /sys/kernel/security/lsm`).
+- **Windows** needs Windows 10 1809 or newer (AppContainer + ConPTY).
+  Build with MSVC (VS2019 16.11 or later; `/std:c++20` required):
 
   ```powershell
   cd engine
@@ -50,7 +69,7 @@ Linux 与 Windows。`--self-test` 的退出码在两个平台上是同一个意�
   .\build\hxd.exe --self-test
   ```
 
-  典型输出（这台机器有全套隔离）：
+  Typical output (this machine has the full set of isolation):
 
   ```json
   {"platform":"windows","kernel":"10.0.26200",
@@ -62,445 +81,623 @@ Linux 与 Windows。`--self-test` 的退出码在两个平台上是同一个意�
    "pty":{"available":true,"backend":"conpty"}}
   ```
 
-  注意 `limits` 里那两个 `false`：Job 对象没有 `RLIMIT_FSIZE` / `RLIMIT_NOFILE`
-  的对位，引擎不假装设上了。详见「两个平台的对应关系」。
+  Note the two `false` values under `limits`: Job objects have no counterpart
+  for `RLIMIT_FSIZE` / `RLIMIT_NOFILE`, and the engine does not pretend they
+  were applied. See "How the two platforms correspond".
 
-  **一次性机器设置（要不要做由你决定）**：AppContainer 默认读不了卷根，
-  而 `dir` / `Get-ChildItem` 要查卷信息 —— 不加这条，沙箱里**列不了任何目录**
-  （读写文件、跑程序都不受影响）。引擎会在 `session.open` 的 warnings 里
-  如实提示，并给出确切命令。每个要当 workspace 的盘各做一次，**需要管理员**：
+  **One-time machine setup (whether to do it is your call)**: an AppContainer
+  cannot read the volume root by default, and `dir` / `Get-ChildItem` query
+  volume information -- without this, **no directory can be listed** inside the
+  sandbox (reading files, writing files and running programs are unaffected).
+  The engine reports this honestly in `session.open`'s warnings along with the
+  exact command. Do it once per drive you want to use as a workspace;
+  **administrator rights required**:
 
   ```powershell
   icacls C:\ /grant "*S-1-15-2-1:(S,X,RA)"
   ```
 
-  只给「同步 + 遍历 + 读属性」，**不给列内容**、不继承 —— 所以 `dir C:\`
-  依然被拒。形状和 Windows 出厂就挂在 `C:\` 上的那条能力 ACE 一样。
-  撤销：`icacls C:\ /remove:g "*S-1-15-2-1"`。
+  It grants synchronize + traverse + read-attributes only, **not**
+  list-contents, and does not inherit -- so `dir C:\` is still refused. The
+  shape matches the capability ACE Windows itself ships on `C:\`.
+  To undo: `icacls C:\ /remove:g "*S-1-15-2-1"`.
 
-### 跑一个任务
+### Run a task
 
 ```bash
 cd host && npm install
 
-# 任意 OpenAI 兼容端点：本机 llama.cpp / DeepSeek / OpenRouter / vLLM …
+# Any OpenAI-compatible endpoint: a local llama.cpp / DeepSeek / OpenRouter / vLLM ...
 export HX_BASE_URL=http://127.0.0.1:8080/v1
 export HX_MODEL=qwen3.8-27b-uncensored
-export HX_CONTEXT_WINDOW=16384          # 必须与服务端 n_ctx 对齐
+export HX_CONTEXT_WINDOW=16384          # must match the server's n_ctx
 
-npx tsx src/cli.ts --root /path/to/repo "把 tests 里失败的用例修好"   # 一次性
-npx tsx src/cli.ts --root /path/to/repo                             # 交互式
+npx tsx src/cli.ts --root /path/to/repo "fix the failing tests"   # one-shot
+npx tsx src/cli.ts --root /path/to/repo                           # interactive
 ```
 
-不给任务且 stdin 是终端时进**交互模式**：同一个会话、同一份历史反复对话，
-`/help` `/tools` `/sandbox` `/exit`，跑到一半 Ctrl+C 在阶段边界中断当前一轮。
-非终端（管道、CI）下不会进 —— 那会立刻读到 EOF，看起来像"什么都没干"。
+With no task and stdin attached to a terminal it enters **interactive mode**:
+one session and one history across repeated turns, with `/help` `/tools`
+`/sandbox` `/exit`, and Ctrl+C mid-run interrupting the current turn at a phase
+boundary. It does not start without a terminal (a pipe, CI) -- there it would
+read EOF immediately and look like it did nothing at all.
 
-### Windows：当成一条命令用
+### Windows: use it as a single command
 
-> Windows 上的完整说明（装、配、验、排错、沙箱边界）在
-> **[docs/windows.md](docs/windows.md)**。不想从源码构建的话，
-> [Releases](https://github.com/lomolomo2/hx/releases) 有打好的包，
-> 解开加进 PATH 就能用（引擎是原生二进制，宿主需要 Node 20+）。
+> The complete Windows guide (install, configure, verify, troubleshoot,
+> sandbox boundaries) is in **[docs/windows.md](docs/windows.md)**. If you
+> would rather not build from source, [Releases](https://github.com/lomolomo2/hx/releases)
+> has a prebuilt package: unpack it, add it to PATH, and it works (the engine
+> is a native binary; the host needs Node 20+).
 
-仓库根的 `hx.ps1` / `hx.cmd` 是个启动器，把这个目录加进 `PATH` 之后：
+`hx.ps1` / `hx.cmd` in the repository root are a launcher. Once that directory
+is on `PATH`:
 
 ```powershell
 cd C:\path\to\your\repo
-hx                                  # 当前目录作工作区，进交互
-hx "把 tests 里失败的用例修好"         # 一次性
+hx                                  # the current directory is the workspace; interactive
+hx "fix the failing tests"          # one-shot
 hx -Net allow -Approval auto -MaxSteps 40 "..."
 ```
 
-**敲 `hx`（走 `hx.cmd`），不要敲 `.\hx.ps1`。** 默认的 Windows 装机执行策略是
-`Restricted`，直接跑 `.ps1` 会被拒（`running scripts is disabled on this system`）。
-`hx.cmd` 带着 `-ExecutionPolicy Bypass` 起 pwsh，存在的理由就是这个 ——
-所以不需要为了用 hx 去改机器的执行策略。没装 PowerShell 7 时它退回
-`powershell.exe`。
+**Type `hx` (which runs `hx.cmd`), not `.\hx.ps1`.** The default Windows
+execution policy is `Restricted`, so running a `.ps1` directly is refused
+(`running scripts is disabled on this system`). `hx.cmd` starts pwsh with
+`-ExecutionPolicy Bypass`, which is exactly why it exists -- so you never have
+to change your machine's execution policy just to use hx. Without PowerShell 7
+it falls back to `powershell.exe`.
 
-端点配置优先级 命令行 > 环境变量 > `~\.hx\config.json`：
+Endpoint configuration precedence: command line > environment >
+`~\.hx\config.json`:
 
 ```json
 { "baseUrl": "https://192.168.1.241/llm/v1", "model": "qwen3.8-27b-uncensored", "contextWindow": 32768 }
 ```
 
-自签证书把 PEM 放到 `~\.hx\certs\llm-<主机名>.pem`，启动器会 `NODE_EXTRA_CA_CERTS`
-**只**信任它，而不是把整个进程的 TLS 校验关掉。
+For a self-signed certificate, put the PEM at `~\.hx\certs\llm-<hostname>.pem`;
+the launcher trusts **only** it via `NODE_EXTRA_CA_CERTS` rather than switching
+off TLS verification for the whole process.
 
-### 起服务
+### Serve it
 
 ```bash
 npx tsx src/server/main.ts --port 4100
 
 curl -X POST localhost:4100/session -H 'content-type: application/json' \
   -d '{"roots":["/path/to/repo"],"sandbox":"workspace-write","net":"deny"}'
-curl -N localhost:4100/session/s1/event                       # SSE 事件流
+curl -N localhost:4100/session/s1/event                       # the SSE event stream
 curl -X POST localhost:4100/session/s1/prompt -H 'content-type: application/json' \
-  -d '{"text":"你的任务"}'
+  -d '{"text":"your task"}'
 ```
 
 ---
 
-## 环境变量
+## Environment variables
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
-| `HX_BASE_URL` | — | OpenAI 兼容端点，必填 |
-| `HX_MODEL` | — | 模型名，必填 |
-| `HX_API_KEY` | 空 | 本地模型通常不需要 |
-| `HX_MAX_TOKENS` | 4096 | 推理模型给少了 `content` 会是空的 |
-| `HX_CONTEXT_WINDOW` | 32768 | **必须与服务端 `n_ctx` 对齐**：设大了会被服务端静默截断，设小了会过早压缩 |
-| `HX_RESERVE_TOKENS` | 4096 | 给回复留的余量 |
-| `HX_KEEP_RECENT_TOKENS` | 6144 | 末尾多少 token 保持原文 |
+| `HX_BASE_URL` | — | An OpenAI-compatible endpoint; required |
+| `HX_MODEL` | — | Model name; required |
+| `HX_API_KEY` | empty | Usually unnecessary for local models |
+| `HX_MAX_TOKENS` | 4096 | Set too low and a reasoning model returns empty `content` |
+| `HX_CONTEXT_WINDOW` | 32768 | **Must match the server's `n_ctx`**: too high and the server truncates silently, too low and compaction kicks in early |
+| `HX_RESERVE_TOKENS` | 4096 | Headroom left for the reply |
+| `HX_KEEP_RECENT_TOKENS` | 6144 | How many trailing tokens stay verbatim |
 | `HX_APPROVAL` | cautious | `auto` / `cautious` / `strict` |
-| `HX_ENGINE` | `../engine/build/hxd`（Windows 上是 `hxd.exe`） | 引擎路径 |
-| `HX_SHELL` | Linux `bash`，Windows `cmd` | `bash` 工具用哪个 shell。**改了它，工具描述里给模型看的方言名也跟着改** —— 名字叫 bash、底下跑 cmd 而不告诉模型，它会一路发 POSIX 命令然后每条都失败 |
-| `HX_SHOW_REASONING` | — | 设了就显示推理模型的思考摘要 |
+| `HX_ENGINE` | `../engine/build/hxd` (`hxd.exe` on Windows) | Engine path |
+| `HX_SHELL` | `bash` on Linux, `cmd` on Windows | Which shell the `bash` tool uses. **Change it and the dialect name shown to the model changes too** -- call it bash, run cmd underneath, and tell the model nothing, and it will send POSIX commands throughout and fail on every one |
+| `HX_SHOW_REASONING` | — | Set it to display a reasoning model's thinking summary |
 
-CLI 参数：`--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`。
+CLI flags: `--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`.
 
 ---
 
-## 安全模型
+## The security model
 
-**两层，正交，互不替代。**
+**Two layers, orthogonal, neither substituting for the other.**
 
-| | 管什么 | 能否绕过 | 失败时 |
+| | Governs | Can it be bypassed | What it stops |
 |---|---|---|---|
-| 策略层（宿主） | 该不该做（意图） | 能——它只是 JavaScript | 拦住"技术上做得到但不该做"的事 |
-| 沙箱层（内核） | 能不能做（能力） | 不能 | 拦住"模型被注入后想做"的事 |
+| Policy layer (host) | What should be done (intent) | Yes -- it is only JavaScript | Things that are technically possible but should not happen |
+| Sandbox layer (kernel) | What can be done (capability) | No | Things the model wants to do after being injected |
 
-只有策略没有沙箱 = 一行 JavaScript 挡在攻击者面前。
-只有沙箱没有策略 = agent 在授权范围内可以任意破坏。
+Policy without a sandbox = one line of JavaScript standing between an attacker
+and the system.
+A sandbox without policy = the agent can wreak arbitrary havoc within what it
+was granted.
 
-### 沙箱层做了什么
+### What the sandbox layer does
 
-下面按 Linux 写。Windows 上每一条的对位见「两个平台的对应关系」，
-机制不同但**性质相同**：都是 allow-list、都在内核里强制、都不靠黑名单。
+Described below for Linux. Each Windows counterpart is in "How the two
+platforms correspond"; the mechanisms differ but **the properties are the
+same**: all allow-lists, all enforced in the kernel, none relying on
+blacklists.
 
-- **Landlock**：文件按 allow-list 授权。默认系统只读路径**不含 `$HOME`** —— 这就是 `cat ~/.ssh/id_rsa` 返回 EACCES 的全部原因，不需要任何黑名单。符号链接逃逸自动被挡（Landlock 在解析后的路径上判定）。
-  Windows 对位是 AppContainer：进程 token 带一个低权限 package SID，
-  只有 DACL 里明确授予了它的对象才放行。用户 profile 默认不授予，
-  于是 `type %USERPROFILE%\.ssh\id_rsa` 直接 ACCESS_DENIED —— 同一个机制。
-  符号链接/junction 逃逸由 `path_guard` 打开句柄后问内核要最终路径来挡
-  （`GetFinalPathNameByHandle`，等价于 `realpath`）。
-- **seccomp-bpf**：封掉 `AF_INET`/`AF_INET6` 的 `socket()`（Landlock 只管 TCP，UDP/DNS 是它的盲区），以及 `ptrace`/`mount`/`keyctl`/`bpf` 等与构建任务无关的 syscall。返回 EPERM 而非 KILL——工具能报告错误，模型才会换路走。
-- **rlimit**：`RLIMIT_NPROC` = **当前 task 数 + 512**（不能写死绝对值——它数的是**线程不是进程**，本机 104 进程对应 667 线程；曾经写死 256，结果沙箱里每次 fork 都失败）、`RLIMIT_FSIZE` 2 GiB、`RLIMIT_NOFILE` 4096。
-- **进程组即所有权**：cell 的直接子进程退出时，若进程组里还有成员，引擎会冻结（SIGSTOP）+ 清扫（SIGKILL）直到组为空。没有这一条，任何 `cmd &` 都会在系统里留下守护进程。
-- **施加顺序**：`fork → chdir → landlock_restrict_self → rlimit → seccomp → execve`。
-  Landlock 撤销不了已打开的 fd，seccomp 装早了会挡掉自己后面的步骤——**顺序错了等于没做**。
-- **装不上沙箱就不执行**（`_exit(126)`），绝不降级为无保护运行。
+- **Landlock**: files are granted by allow-list. The default system read-only
+  paths **do not include `$HOME`** -- that alone is the entire reason
+  `cat ~/.ssh/id_rsa` returns EACCES, with no blacklist involved. Symlink
+  escapes are blocked automatically (Landlock judges on the resolved path).
+  The Windows counterpart is AppContainer: the process token carries a
+  low-privilege package SID, and only objects whose DACL explicitly grants it
+  are allowed. The user profile does not grant it by default, so
+  `type %USERPROFILE%\.ssh\id_rsa` is a flat ACCESS_DENIED -- the same
+  mechanism. Symlink and junction escapes are blocked by `path_guard` opening a
+  handle and asking the kernel for the final path
+  (`GetFinalPathNameByHandle`, the equivalent of `realpath`).
+- **seccomp-bpf**: blocks `socket()` for `AF_INET`/`AF_INET6` (Landlock covers
+  TCP only, with UDP/DNS its blind spot), plus syscalls irrelevant to a build
+  task such as `ptrace`/`mount`/`keyctl`/`bpf`. It returns EPERM rather than
+  KILL -- a tool that can report an error is what makes the model try another
+  route.
+- **rlimit**: `RLIMIT_NPROC` = **current task count + 512** (an absolute value
+  must never be hardcoded -- it counts **threads, not processes**; on this
+  machine 104 processes correspond to 667 threads, and hardcoding 256 once made
+  every fork inside the sandbox fail), `RLIMIT_FSIZE` 2 GiB, `RLIMIT_NOFILE`
+  4096.
+- **The process group is ownership**: when a cell's direct child exits, if the
+  process group still has members the engine freezes (SIGSTOP) and sweeps
+  (SIGKILL) until it is empty. Without this, any `cmd &` leaves a daemon behind
+  on the system.
+- **Order of application**:
+  `fork -> chdir -> landlock_restrict_self -> rlimit -> seccomp -> execve`.
+  Landlock cannot revoke already-open fds, and seccomp applied too early blocks
+  the steps that follow -- **the wrong order means it never happened**.
+- **If the sandbox cannot be applied, do not execute** (`_exit(126)`), and
+  never degrade to running unprotected.
 
-### 诚实的边界
+### The honest boundaries
 
-- **`RLIMIT_NPROC` 按真实 UID 计数、且数的是线程。** 上限只能相对当前用量来设（当前 + 512）。fork 炸弹会被挡住、机器活下来，但同一用户的其它进程在攻击期间也可能 fork 失败。**这是缓解，不是隔离。**
-- **cgroup v2 有探测但本机不可用。** `--self-test` 会实际走一遍「启用控制器 → 建子 cgroup → 写 pids.max/memory.max → 读回校验」，并如实回报：
+- **`RLIMIT_NPROC` counts by real UID, and counts threads.** The limit can only
+  be set relative to current usage (current + 512). A fork bomb is stopped and
+  the machine survives, but the same user's other processes may also fail to
+  fork during the attack. **This is mitigation, not isolation.**
+- **cgroup v2 is probed but unusable on this machine.** `--self-test` actually
+  walks "enable the controllers -> create a child cgroup -> write
+  pids.max/memory.max -> read back and verify", and reports honestly:
 
   ```json
   "cgroup2": {"available": true, "usable": false,
     "reason": "enable subtree_control: ...: Device or resource busy"}
   ```
 
-  `available` 只说文件系统在，`usable` 才说限额装得上。普通用户会话里 hxd 与 shell 同处一个 scope，写 `cgroup.subtree_control` 会 `EBUSY`（cgroup v2 的"无内部进程"规则）。把引擎放进独立 scope（`systemd-run --user --scope -p Delegate=yes`）即可用上 —— 那是部署方式的选择，引擎不该自作主张。探测本身无副作用：只还原自己新启用的控制器，用户原有的不动。
-  **注意 `Cgroup2Session` 尚未接进 spawn 路径**，目前只有探测与会话原语。
-- **`danger-full-access` 模式下没有内核强制**，只剩 `path_guard` 的软校验。
-- Linux 与 Windows。macOS Seatbelt 留了接口 seam（`sandbox/confine.hpp`），未实现。
+  `available` only says the filesystem is there; `usable` says the limits can
+  be applied. In an ordinary user session hxd shares a scope with the shell, so
+  writing `cgroup.subtree_control` gives `EBUSY` (cgroup v2's "no internal
+  processes" rule). Put the engine in its own scope
+  (`systemd-run --user --scope -p Delegate=yes`) and it works -- that is a
+  deployment choice, and not the engine's to make unilaterally. The probe
+  itself has no side effects: it restores only the controllers it newly
+  enabled and leaves the user's own alone.
+  **Note that `Cgroup2Session` is not yet wired into the spawn path**; only the
+  probe and the session primitives exist today.
+- **Under `danger-full-access` there is no kernel enforcement**, leaving only
+  `path_guard`'s soft validation.
+- Linux and Windows. macOS Seatbelt has an interface seam
+  (`sandbox/confine.hpp`) but is not implemented.
 
 ---
 
-## 两个平台的对应关系
+## How the two platforms correspond
 
-安全模型本来就是照着 Windows 的 user/kernel 分界设计的（见开头「特权边界」那条），
-所以移到 Windows 上不是"找个近似物凑合"，而是回到它的原型。
-每一条的细节都写在对应源文件的注释里。
+The security model was designed against Windows's user/kernel divide to begin
+with (see "The privilege boundary" above), so moving to Windows is not
+"finding an approximation that will do" -- it is returning to the prototype.
+The details of each row live in the comments of the corresponding source file.
 
-| 要解决的问题 | Linux | Windows | 哪边更强 |
+| The problem to solve | Linux | Windows | Which is stronger |
 |---|---|---|---|
-| 文件按 allow-list 授权 | Landlock ruleset | AppContainer SID + 目录 ACE | 平手 |
-| `$HOME` 默认不可读 | 不加进 ruleset | 用户 profile 不授予 package SID | 平手 |
-| 断网 | Landlock(TCP) **+** seccomp(AF_INET，补 UDP 盲区) | 不授予 `internetClient` 能力，WFP 内核拦截 | **Windows**：一层覆盖 TCP+UDP，没有盲区 |
-| 进程数上限 | `RLIMIT_NPROC`（按 UID、数线程） | Job `ActiveProcessLimit`（按 Job、数进程） | **Windows**：可写绝对值，不影响同用户其它进程 |
-| 内存上限 | 无（cgroup 未接进 spawn 路径） | Job `JobMemoryLimit` | **Windows** |
-| 单文件大小 / fd 数上限 | `RLIMIT_FSIZE` / `RLIMIT_NOFILE` | **无对位** | **Linux** |
-| 进程组即所有权 | `setsid` + `kill(-pgid)` + 反复清扫 | Job 对象，`TerminateJobObject` 原子终止 | **Windows**：没有"和 fork 速度赛跑"这回事 |
-| 引擎自己被 `kill -9` 后 | 子孙被 init 收养，继续活着 | `KILL_ON_JOB_CLOSE`，内核连带收干净 | **Windows** |
-| 交互式会话 | `forkpty` | ConPTY（`CreatePseudoConsole`） | 平手 |
-| 事件循环 | epoll | IOCP + overlapped 命名管道 | 平手 |
-| 降权的时机 | fork 后子进程 `landlock_restrict_self`，**顺序错了等于没做** | `CreateProcess` 时把 token 定死，子进程没有窗口期 | **Windows**：不存在顺序错误这一类 bug |
+| Files granted by allow-list | Landlock ruleset | AppContainer SID + directory ACEs | Tie |
+| `$HOME` unreadable by default | Not added to the ruleset | The user profile does not grant the package SID | Tie |
+| Cutting off the network | Landlock(TCP) **+** seccomp(AF_INET, covering the UDP blind spot) | No `internetClient` capability; WFP blocks in the kernel | **Windows**: one layer covers TCP+UDP, with no blind spot |
+| Process count limit | `RLIMIT_NPROC` (by UID, counts threads) | Job `ActiveProcessLimit` (by Job, counts processes) | **Windows**: an absolute value is fine and does not affect the user's other processes |
+| Memory limit | None (cgroup not wired into the spawn path) | Job `JobMemoryLimit` | **Windows** |
+| Per-file size / fd count limit | `RLIMIT_FSIZE` / `RLIMIT_NOFILE` | **No counterpart** | **Linux** |
+| The process group is ownership | `setsid` + `kill(-pgid)` + repeated sweeping | Job objects; `TerminateJobObject` terminates atomically | **Windows**: there is no "racing against fork" at all |
+| After the engine itself is `kill -9`ed | Descendants are reparented to init and live on | `KILL_ON_JOB_CLOSE`; the kernel collects them too | **Windows** |
+| Interactive sessions | `forkpty` | ConPTY (`CreatePseudoConsole`) | Tie |
+| Event loop | epoll | IOCP + overlapped named pipes | Tie |
+| When privileges drop | The child calls `landlock_restrict_self` after fork; **the wrong order means it never happened** | The token is fixed at `CreateProcess` time, leaving the child no window | **Windows**: this class of ordering bug does not exist |
 
-### Windows 侧诚实的边界
+### The honest boundaries on Windows
 
-- **`RLIMIT_FSIZE` / `RLIMIT_NOFILE` 没有对位。** Job 对象不限单文件大小、
-  不限句柄数。`--self-test` 把这两项报成 `false`，`session_meta` 因此能看出
-  这次运行到底限住了什么。写爆磁盘只能靠内存上限 + 超时 + 审批兜底，不是内核强制。
-- **`exec.kill` 的 `TERM`/`INT`/`HUP`/`QUIT` 基本一定失败，这是对的。**
-  Windows 没有这些信号；最接近的 CTRL_BREAK 只能发给同一个控制台上的进程，
-  而 cell 有自己的控制台。送不到就返回 `killed:false`，
-  **绝不悄悄升级成强杀** —— 那会让调用方以为进程有机会清理，而它没有。
-  `KILL` 是精确的（`TerminateJobObject`）。
-- **单线程无锁这条性质打了个折扣。** 宿主（Node/libuv）给子进程的标准句柄是
-  **同步**句柄，进不了 IOCP，对它 `ReadFile` 就是阻塞。所以 Windows 上 stdio
-  由两个只搬字节的线程驱动（`io/io_win.cpp` 顶部有完整说明）。
-  **引擎状态仍然是单线程的** —— 那两个线程不碰 `cells_`/`waits_`/`policy_`
-  里的任何东西，竞态面被压到「一个缓冲 + 一把锁」。
-- **授权 roots 是在真实目录上加 ACE，这是对文件系统的持久修改。**
-  ACE 只授予本会话那个唯一的 AppContainer SID，`Confinement` 析构时撤销。
-  被 `kill -9` 时 ACE 会残留（profile 则由下次启动的扫描清掉）。
+- **`RLIMIT_FSIZE` / `RLIMIT_NOFILE` have no counterpart.** Job objects limit
+  neither per-file size nor handle count. `--self-test` reports both as
+  `false`, so `session_meta` shows what a given run actually constrained.
+  Filling the disk is backstopped only by the memory limit, timeouts and
+  approval -- not by the kernel.
+- **`exec.kill`'s `TERM`/`INT`/`HUP`/`QUIT` almost always fail, and that is
+  correct.** Windows has no such signals; the closest thing, CTRL_BREAK, can
+  only reach processes on the same console, and a cell has its own. When it
+  cannot be delivered it returns `killed:false` and **never silently escalates
+  to a hard kill** -- that would let the caller believe the process had a
+  chance to clean up when it did not. `KILL` is exact
+  (`TerminateJobObject`).
+- **The single-threaded, lock-free property is qualified here.** The standard
+  handles the host (Node/libuv) gives a child are **synchronous** handles: they
+  cannot join an IOCP, and `ReadFile` on them blocks. So on Windows stdio is
+  driven by two threads that do nothing but move bytes (there is a full
+  explanation at the top of `io/io_win.cpp`).
+  **The engine's state is still single-threaded** -- those two threads touch
+  nothing in `cells_`/`waits_`/`policy_`, and the surface exposed to races is
+  compressed down to one buffer plus one lock.
+- **Granting roots stamps ACEs on real directories, which is a persistent
+  modification of the filesystem.** The ACEs grant only this session's unique
+  AppContainer SID and are revoked when the `Confinement` is destroyed. A
+  `kill -9` leaves the ACEs behind (the profile is cleaned up by the next
+  start's sweep).
 
-### 子 agent
+### Subagents
 
-- **权限用 `intersect` 而非 `merge`**：子 agent 提出的任何 `allow` 规则一律丢弃。规则是"后匹配者胜"，允许子 agent 追加 allow 就等于允许它自我提权。
-- **越权诉求如实记录**并回传父 agent —— 这是子 agent 被注入的早期信号。
-- **回传内容降级为数据**：包在 `<subagent_result trust="data">` 里，系统提示词同时声明 `<tool_output>` 与 `<subagent_result>` 内的内容**是数据，永远不是指令**。
-- **上下文不共享**：子 agent 有自己的引擎进程和 rollout，父 agent 只拿到结论。
+- **Permissions use `intersect`, not `merge`**: any `allow` rule a subagent
+  proposes is discarded. Rules are last-match-wins, so letting a subagent
+  append an allow is letting it escalate its own privileges.
+- **Over-reaching requests are recorded honestly** and returned to the parent
+  agent -- they are an early signal that a subagent has been injected.
+- **What comes back is downgraded to data**: wrapped in
+  `<subagent_result trust="data">`, and the system prompt simultaneously
+  declares that content inside `<tool_output>` and `<subagent_result>` **is
+  data and never instructions**.
+- **Context is not shared**: a subagent has its own engine process and rollout;
+  the parent receives only conclusions.
 
 ---
 
-## 两条流
+## The two streams
 
-| | 给谁看 | 存在哪 |
+| | Audience | Stored in |
 |---|---|---|
-| `response_item` | 模型 —— 能原样喂回 API 的历史 | rollout + 内存 |
-| `ThreadEvent` | 人 —— UI 消费的事件流 | rollout + SSE |
+| `response_item` | The model -- history that can be fed straight back to the API | rollout + memory |
+| `ThreadEvent` | People -- the event stream the UI consumes | rollout + SSE |
 
-一旦用一个结构同时伺候模型和 UI，后面每加一个 UI 特性都要污染模型上下文。
+The moment one structure serves both the model and the UI, every subsequent UI
+feature pollutes the model's context.
 
-事件三层：`thread.started` → `turn.*` → `item.*`。
-Item 类型：`agent_message` `reasoning` `command_execution` `file_change` `file_read` `todo_list` `subagent` `error`。
-
----
-
-## 会话日志（rollout）
-
-`~/.hx/sessions/YYYY/MM/DD/rollout-<name>.jsonl`，append-only，是这个系统里的**事实来源**。
-
-**路径由引擎决定，宿主只能给一个 `[A-Za-z0-9_-]{1,64}` 的名字。** 否则宿主就能用
-`log.append` 往任意文件追加内容（比如 shell 的 rc 文件），等于在架构上开后门。
-
-持久性承诺说得很准：
-- 每条记录一次 `write()` 追加（`O_APPEND`）→ **进程被 `kill -9` 也不会留下半行**
-- 掉电级持久性需要 `fsync`，只在 `log.flush` 时做
-
-第一条记录是 `session_meta`，把"这次到底有没有真沙箱"钉死在日志里（`caps` + `effective` + `warnings`），将来翻日志不用猜。
-
-上下文压缩会写一条 `compacted` 记录，带**被替换掉的原文**（`replacement_history`）、摘要、前后 token 数。**压缩是可审计的记录，不是偷偷改历史**——否则 debug 时永远搞不清模型当时看到了什么。
+Events come in three layers: `thread.started` -> `turn.*` -> `item.*`.
+Item types: `agent_message` `reasoning` `command_execution` `file_change`
+`file_read` `todo_list` `subagent` `error`.
 
 ---
 
-## 上下文管理
+## The session log (rollout)
 
-- **token 估算自校准**：用每次真实 `usage` 反推字符/token 比值。中英文、代码、JSON 的比值差很多，写死常数必然失真。
-- **两条压缩不变量**：绝不切散 `assistant(tool_calls)` 与它的 `tool` 结果（切散了服务端会直接拒绝）；最后一组 assistant+tool 永远保留（否则"刚读完的大文件立刻被压掉"，模型以为没读过，再读，死循环）。
-- **摘要输入必须包含原始任务**。漏掉它时模型在摘要里写下了 *"The original task statement isn't in the visible history"*，然后丢掉目标开始重新探索。
-- **中段截断**：命令输出保头（跑了什么、首个错误）保尾（最终状态、结论、堆栈），砍中间。
+`~/.hx/sessions/YYYY/MM/DD/rollout-<name>.jsonl`, append-only, and **the source
+of truth** in this system.
+
+**The engine decides the path; the host may only supply a name matching
+`[A-Za-z0-9_-]{1,64}`.** Otherwise the host could use `log.append` to append to
+any file at all (a shell's rc file, say) -- an architectural back door.
+
+The durability promise, stated precisely:
+- each record is appended with one `write()` (`O_APPEND`) -> **a process killed
+  with `kill -9` never leaves half a line**
+- power-loss durability requires `fsync`, which happens only on `log.flush`
+
+The first record is `session_meta`, nailing "did this run have a real sandbox"
+into the log (`caps` + `effective` + `warnings`) so that reading the log later
+requires no guessing.
+
+Context compaction writes a `compacted` record carrying **the original text it
+replaced** (`replacement_history`), the summary, and token counts before and
+after. **Compaction is an auditable record, not a quiet rewrite of history** --
+otherwise, while debugging, you could never work out what the model saw at the
+time.
 
 ---
 
-## 测试
+## Context management
+
+- **Self-calibrating token estimation**: the real `usage` from each call is
+  used to derive the characters-per-token ratio backwards. That ratio differs a
+  great deal between mixed-script prose, code and JSON, so a hardcoded constant
+  is bound to be wrong.
+- **Two compaction invariants**: never split `assistant(tool_calls)` from its
+  `tool` results (split them and the server rejects the request outright); and
+  always keep the final assistant+tool group (otherwise "a large file just read
+  is immediately compacted away", the model believes it never read it, reads it
+  again, and loops forever).
+- **The summary input must include the original task.** With it missing, the
+  model wrote *"The original task statement isn't in the visible history"* into
+  its summary, then dropped the goal and started exploring again.
+- **Middle truncation**: command output keeps the head (what ran, the first
+  error) and the tail (the final state, the conclusion, the stack trace), and
+  cuts the middle.
+
+---
+
+## Tests
 
 ```bash
-cd host && npm test          # Linux：十一个套件
+cd host && npm test          # Linux: eleven suites
 ```
 
 ```powershell
-cd host; pwsh test\all.ps1   # Windows：七个套件
+cd host; pwsh test\all.ps1   # Windows: seven suites
 ```
 
-| 套件 | 验什么 |
+| Suite | What it verifies |
 |---|---|
-| typecheck | TS strict 全开 |
-| arch.sh | 宿主不得碰 fs / 起进程（含自检：故意加违规能被抓到） |
-| escape/run.sh | 22 项：逃逸拦截 + **可用性（该放的必须放得通）**，`xfail=0` |
-| durability/kill9.py | 写日志途中 `kill -9`，10 万行零破损 |
-| limits/forkbomb.py | fork 炸弹有界且被清理；`cmd &` 的后台进程不外泄 |
-| pty/interactive.py | REPL 交互 + **沙箱在 pty 这条独立路径同样生效** |
-| e2e.ts | 多步任务：计划→测试失败→读→补丁→测试通过 |
-| compaction.ts | 压缩触发、留痕、不切散工具配对 |
-| approval.ts | 规则引擎 + ask 挂起恢复 + allow_always |
-| subagent.ts | 权限单调不增、上下文隔离、内容降级 |
-| server.ts | HTTP/SSE 全流程 + 经 HTTP 的审批 |
+| typecheck | TS strict fully enabled |
+| arch.sh | The host must not touch fs / start processes (self-checking: a deliberate violation is caught) |
+| escape/run.sh | 22 checks: escape blocking + **usability (what should pass must get through)**, `xfail=0` |
+| durability/kill9.py | `kill -9` mid-write; 100,000 lines with zero corruption |
+| limits/forkbomb.py | A fork bomb stays bounded and is cleaned up; `cmd &`'s background process does not leak |
+| pty/interactive.py | REPL interaction + **the sandbox is equally enforced on the separate pty path** |
+| e2e.ts | A multi-step task: plan -> tests fail -> read -> patch -> tests pass |
+| compaction.ts | Compaction triggers, leaves a trace, and never splits a tool pair |
+| approval.ts | The rule engine + ask suspend/resume + allow_always |
+| subagent.ts | Monotonically non-increasing permissions, context isolation, content downgrade |
+| server.ts | The full HTTP/SSE flow + approval over HTTP |
 
-Windows 上 `escape` / `kill9` / `pty` / `forkbomb` 这四个引擎套件没有直接对位
-（它们探的是 Landlock / seccomp / RLIMIT 的具体行为），换成了
-`engine/tests/windows/smoke.ps1`：**24 项，验的是同一批性质** ——
-该放的放得通、该拒的拒掉、进程树不外泄、超时杀得掉、pty 能跑、被强杀之后的残留下次启动清得掉，
-只是问的是 AppContainer 和 Job 对象。其中有一项是 Linux 侧验不了的：
-`net=deny` 能不能挡住 **UDP/DNS**（Landlock 的盲区，Linux 靠 seccomp 补，
-Windows 天然覆盖）。
+On Windows the four engine suites `escape` / `kill9` / `pty` / `forkbomb` have
+no direct counterpart (they probe the specific behaviour of Landlock / seccomp
+/ RLIMIT), and are replaced by `engine/tests/windows/smoke.ps1`: **24 checks
+verifying the same set of properties** -- what should pass gets through, what
+should be refused is refused, the process tree does not leak, timeouts kill,
+pty works, and residue from a hard kill is cleaned up by the next start -- just
+by asking AppContainer and Job objects instead. One of them cannot be verified
+on Linux at all: whether `net=deny` blocks **UDP/DNS** (Landlock's blind spot,
+which Linux patches with seccomp and Windows covers natively).
 
-**两条经验**：
+**Two lessons**:
 
-1. 安全测试只验"该拒的拒了"，验不出"该放的没放"。`/dev/null` 授权带错访问位、`RLIMIT_NPROC` 写死 256 —— 两次都是逃逸套件全绿而实际工作全废。逃逸套件因此专门有一节「可用性：该放的必须放得通」。
-2. **测试路径必须等于生产路径。** `--sandbox-exec` 少设了 `TMPDIR`、不杀进程组，导致测试在一个真实会话里不存在的环境下通过。这个坑在本项目里踩过三次。
+1. A security test verifies that the forbidden was refused; it cannot detect
+   that the permitted was blocked. Granting `/dev/null` with the wrong access
+   bits, and hardcoding `RLIMIT_NPROC` to 256 -- both times the escape suite was
+   entirely green while the actual work was entirely broken. That is why the
+   escape suite has a dedicated "usability: what should pass must get through"
+   section.
+2. **The test path must equal the production path.** `--sandbox-exec` once
+   failed to set `TMPDIR` and did not kill the process group, so tests passed
+   in an environment that does not exist in a real session. This trap has been
+   hit three times in this project.
 
 ---
 
-## 目录
+## Layout
 
 ```
-proto/hxp-v0.md            协议规范（先于实现；实现与它不符时，改的是实现）
+proto/hxp-v0.md            the protocol spec (written before the implementation;
+                           when they disagree, the implementation is what changes)
 engine/
-  src/platform/            NowMs · 路径形状 · 文件原语（两平台各一份实现）
-  src/io/                  Reactor + 非阻塞流（Linux epoll / Windows IOCP）
-  src/sandbox/             caps 探测 · policy · confine（平台 seam）
-      landlock · seccomp · cgroup        —— Linux
-      confine_win（AppContainer + ACE）  —— Windows
-  src/exec/                spawn · pty · cell · env · rlimit · proc（进程树所有权）
-  src/fs/                  path_guard（唯一把字符串变成路径的地方）· apply_patch
+  src/platform/            NowMs, path shape, file primitives (one implementation per platform)
+  src/io/                  Reactor + non-blocking streams (Linux epoll / Windows IOCP)
+  src/sandbox/             caps probing, policy, confine (the platform seam)
+      landlock, seccomp, cgroup           -- Linux
+      confine_win (AppContainer + ACEs)   -- Windows
+  src/exec/                spawn, pty, cell, env, rlimit, proc (process-tree ownership)
+  src/fs/                  path_guard (the only place a string becomes a path), apply_patch
   src/log/                 rollout
-  src/engine.cpp           事件循环与 op 分发（单线程 reactor，引擎状态无锁无竞态）
-  tests/                   escape · durability · pty · limits  —— Linux
-      windows/smoke.ps1                                        —— Windows
+  src/engine.cpp           the event loop and op dispatch (single-threaded reactor; engine state is lock- and race-free)
+  tests/                   escape, durability, pty, limits  -- Linux
+      windows/smoke.ps1                                     -- Windows
 host/
-  src/platform.ts          宿主侧的平台差异（引擎路径 · shell · 路径比较）
-  src/protocol/            ThreadEvent / Item / hxp 类型
-  src/engine/client.ts     唯一允许 spawn 引擎的文件
+  src/platform.ts          host-side platform differences (engine path, shell, path comparison)
+  src/protocol/            ThreadEvent / Item / hxp types
+  src/engine/client.ts     the only file allowed to spawn the engine
   src/tools/               bash read apply_patch glob grep task todo
-  src/context/             budget · compact · truncate
-  src/policy/              rules · presets · approval · intersect
-  src/loop/turn.ts         四阶段状态机
+  src/context/             budget, compact, truncate
+  src/policy/              rules, presets, approval, intersect
+  src/loop/turn.ts         the four-phase state machine
   src/server/              Hono + SSE
-  test/all.sh · all.ps1    两个平台各自的全量回归
-hx.ps1 · hx.cmd            Windows 启动器：加进 PATH 后在任意仓库里敲 `hx`
-try-hx.ps1                 Windows 试跑入口（-Caps / -Sandbox / -Repl / 离线任务）
+  test/all.sh, all.ps1     each platform's full regression suite
+hx.ps1, hx.cmd             the Windows launcher: add to PATH and type `hx` in any repo
+try-hx.ps1                 the Windows try-it entry point (-Caps / -Sandbox / -Repl / an offline task)
 ```
 
-**平台切分的原则：整个文件按平台挑，不在文件里撒 `#ifdef`。**
-散落的 `#ifdef` 会让两条路径互相看不见，改一边忘一边；整文件切分至少保证
-两边的函数签名必须对得上，编译器会盯着。选择在 `engine/CMakeLists.txt` 里。
+**The principle for splitting by platform: select whole files, never scatter
+`#ifdef` inside them.** Scattered `#ifdef`s let the two paths drift out of sight
+of each other, so one gets changed and the other forgotten; splitting by file at
+least forces the function signatures on both sides to line up, with the
+compiler watching. The selection lives in `engine/CMakeLists.txt`.
 
-`turn.ts` 的四个阶段是显式状态：`assembling → streaming → executing → settling`。
-"工具执行到一半触发上下文压缩"是真实的 bug 类别，和"在 `DISPATCH_LEVEL` 访问分页内存"是同一种错误——建成显式状态后，`PhaseError` 会在写错时当场抛出。
+`turn.ts`'s four phases are explicit state:
+`assembling -> streaming -> executing -> settling`. "Context compaction fires
+while a tool is mid-execution" is a real class of bug, and the same kind of
+error as "touching paged memory at `DISPATCH_LEVEL`" -- built as explicit
+state, `PhaseError` throws on the spot when it is written wrong.
 
 ---
 
-## 已知的坑（踩过的）
+## Known traps (all of them hit)
 
-- **nvm / rustup / conda 装在 `$HOME` 的工具链在沙箱里跑不了**，因为 `$HOME` 默认不可读。这不是 bug 是设计正确的表现，但要把路径显式加进 roots。
-- **`HX_CONTEXT_WINDOW` 必须与服务端 `n_ctx` 对齐**。llama.cpp 可从 `/props` 读到。
-- **Python 的 `.pyc` 缓存会骗你**：改动若字节数不变且落在同一秒内，`(mtime秒, size)` 校验会判定缓存有效——agent 改对了却仍报失败。测试用 `python3 -B`。
-- **`bash -lc` 会读 `~/.profile`**，而 `$HOME` 不可读 → 每条命令带一行噪音。用 `bash -c`。
-- **`RLIMIT_NPROC` 数的是线程不是进程。** 绝不能写死绝对值：本机 104 个进程对应 667 个线程，写死 256 会让沙箱里每次 `fork` 都失败。
-- **cell 必须拥有它的进程组。** `bash -c 'cmd &'` 的顶层 bash 会立刻正常退出（`exit_code=0`），超时分支因此不触发，后台进程永远留在系统里。直接子进程退出时必须检查进程组是否还有成员。
-- **REPL 取输入不能每轮 `rl.question()`。** 它只在被调用的那一刻接一行：模型跑着的时候敲进来的东西 readline 照样读走，但没人接，于是无声丢掉（typeahead 全没）。管道喂输入更极端——readline 一口气读完整个管道，第一行之后全丢，然后 EOF 直接退出。正确做法是常驻 `'line'` 监听 + 队列，把"读"和"取"解耦。审批提问不会被这个监听抢走：readline 在 `question` 挂起期间不发 `'line'`。
-- **同一个 stdin 上不能同时活着两个 readline。** 会互相抢输入；先关掉的那个还会把已进缓冲区的字节一并吞掉。REPL 与审批提问必须共用一个。
-- **事件循环里不能有无界读循环、也不能阻塞写 stdout。** 前者会被高产出的子进程饿死，后者会被读得慢的宿主冻住 —— 两种都会让超时与回收全部停摆。
+- **Toolchains that nvm / rustup / conda install into `$HOME` cannot run in the
+  sandbox**, because `$HOME` is unreadable by default. This is not a bug but the
+  design working correctly; add the path to roots explicitly.
+- **`HX_CONTEXT_WINDOW` must match the server's `n_ctx`.** llama.cpp exposes it
+  at `/props`.
+- **Python's `.pyc` cache will lie to you**: if a change keeps the byte count
+  identical and lands within the same second, the `(mtime seconds, size)` check
+  judges the cache valid -- so the agent fixed it correctly and the test still
+  reports failure. Test with `python3 -B`.
+- **`bash -lc` reads `~/.profile`**, and `$HOME` is unreadable, so every
+  command carries a line of noise. Use `bash -c`.
+- **`RLIMIT_NPROC` counts threads, not processes.** An absolute value must
+  never be hardcoded: on this machine 104 processes correspond to 667 threads,
+  and hardcoding 256 makes every `fork` inside the sandbox fail.
+- **A cell must own its process group.** The top-level bash of
+  `bash -c 'cmd &'` exits normally and immediately (`exit_code=0`), so the
+  timeout branch never fires and the background process stays on the system
+  forever. When the direct child exits, the process group must be checked for
+  remaining members.
+- **A REPL must not take input with `rl.question()` per turn.** It accepts a
+  line only at the moment it is called: anything typed while the model is
+  running is still read by readline, has no receiver, and is silently dropped
+  (all typeahead lost). Feeding input through a pipe is more extreme --
+  readline consumes the whole pipe in one go, everything after the first line
+  is lost, and then EOF exits outright. The right approach is a persistent
+  `'line'` listener plus a queue, decoupling "reading" from "taking". The
+  approval question is not stolen by that listener: readline does not emit
+  `'line'` while a `question` is pending.
+- **Two readlines must never be alive on one stdin.** They fight over input,
+  and whichever closes first also swallows the bytes already buffered. The REPL
+  and the approval question must share one.
+- **The event loop must contain no unbounded read loop and must never block
+  writing to stdout.** The former starves under a high-output child, the latter
+  freezes under a slow-reading host -- either brings timeouts and reaping to a
+  complete halt.
 
-### Windows 特有的（都踩过）
+### Windows-specific (all of them hit)
 
-前四条是同一类错误的四个变体：**冒烟用例恰好只覆盖了简单情况，于是套件全绿而实际工作全废**
-—— 和 README 上面那条「安全测试验不出该放的没放」是同一个病。
+The first four are four variants of one error: **the smoke cases happened to
+cover only the simple situations, so the suite was green while the actual work
+was entirely broken** -- the same disease as "a security test cannot detect
+that the permitted was blocked" above.
 
-- **AppContainer 读不了卷根，于是 `dir` 全线失败。** 这条最贵，因为它同时具备
-  「症状严重」和「症状误导」两个属性。
-  `icacls C:\` 里没有 ALL APPLICATION PACKAGES（数据盘如 `H:\` 更是一条
-  AppContainer 授权都没有），而 cmd 的 `dir` 会去查卷信息 —— 结果是连
-  `dir /b <自己的工作区>` 都报 "Access is denied"，而**同一个目录**用 .NET 的
-  `GetFileSystemEntries` 枚举完全正常，`type <文件>` 也完全正常。
-  `vol` 同样被拒；`powershell.exe` 校验不了 cwd，把 provider location 悄悄退回
-  `C:\`，于是所有 cmdlet 的相对路径都指错地方（而 .NET 的相对路径是对的 ——
-  同一个进程里两套相对路径语义）。
-  实测拿真模型跑任务：**20 步全耗在「我的文件到底在哪」上**，
-  `dir` 拒、`cd && dir` 拒、`Get-ChildItem` 拒，而 `fs.read` 明明读得到文件。
-  解法是在**卷根**上加一条最小 ACE：`(S,X,RA)` —— 同步 + 遍历 + 读属性，
-  **不给 `FILE_READ_DATA`**（目录上它就是 `FILE_LIST_DIRECTORY`），不继承。
-  于是 `dir` 能用，而 `dir C:\` 依然被拒。`SYNCHRONIZE` 不能漏 ——
-  只给 `(X,RA)` 的话 `dir` 照样 "Access is denied"。
-  · 这是**一次性的机器设置，不是引擎每次去打的**。实测 `icacls C:\ /grant`
-    单次要 **16 秒**（卷根的子项要参与继承传播），而会话要 grant + revoke 两次，
-    于是每个 `session.open` 平白多出 30 多秒。引擎改成只**检查**，
-    缺了就发一条带确切修复命令的 warning，授权与否由用户决定：
+- **An AppContainer cannot read the volume root, so `dir` fails everywhere.**
+  This one was the most expensive, because it is both severe and misleading.
+  `icacls C:\` has no ALL APPLICATION PACKAGES (and a data drive such as `H:\`
+  has no AppContainer grant at all), while cmd's `dir` queries volume
+  information -- so even `dir /b <your own workspace>` reports "Access is
+  denied", while enumerating **the same directory** with .NET's
+  `GetFileSystemEntries` works perfectly, as does `type <file>`.
+  `vol` is refused likewise; `powershell.exe` cannot validate its cwd and
+  quietly falls its provider location back to `C:\`, so relative paths in every
+  cmdlet aim at the wrong place (while .NET relative paths are correct -- two
+  sets of relative-path semantics in one process).
+  Measured with a real model: **all 20 steps went on "where are my files"**,
+  with `dir` refused, `cd && dir` refused, `Get-ChildItem` refused, while
+  `fs.read` could clearly read files.
+  The fix is one minimal ACE on the **volume root**: `(S,X,RA)` -- synchronize
+  + traverse + read-attributes, **without `FILE_READ_DATA`** (which on a
+  directory is `FILE_LIST_DIRECTORY`), not inherited. So `dir` works while
+  `dir C:\` is still refused. `SYNCHRONIZE` must not be omitted -- with only
+  `(X,RA)`, `dir` still says "Access is denied".
+  - This is a **one-time machine setup, not something the engine stamps on
+    every run**. Measured, a single `icacls C:\ /grant` takes **16 seconds**
+    (the volume root's children take part in inheritance propagation), and a
+    session would grant and revoke, adding 30-odd seconds to every
+    `session.open`. The engine only **checks**, and when the grant is missing
+    emits a warning carrying the exact fix command, leaving the decision to the
+    user:
 
     ```
     icacls C:\ /grant "*S-1-15-2-1:(S,X,RA)"
     ```
 
-  · PowerShell 还要多一步：`Set-Location <绝对路径>` 依然 Access denied
-    （它要访问父目录）。可行的是 `New-PSDrive -Root <工作区>` 再
-    `Set-Location hx:` —— 宿主的 `shellCommand` 给 pwsh 分支自动加了这一段。
-  · 顺带一条**反面教训**：一度试过「从卷根到工作区逐级给遍历权」，
-    想顺便修好 powershell 的 location。结果是灾难 —— `SetNamedSecurityInfoW`
-    作用在一个目录上会**向整个子树重算继承**，在 `C:\Users\<user>` 上调它
-    等于遍历整个用户 profile，直接挂住十分钟，而且中途被杀会在用户目录上
-    留下 ACE。祖先链这条路不能走；powershell 的 location 改在宿主侧解决
-    （`shellCommand` 给它加一句 `Set-Location ([Environment]::CurrentDirectory)`）。
+  - PowerShell needs one more step: `Set-Location <absolute path>` is still
+    Access denied (it needs the parent directory). What works is
+    `New-PSDrive -Root <workspace>` followed by `Set-Location hx:` -- the
+    host's `shellCommand` prepends exactly that on the pwsh branch.
+  - And a **cautionary tale**: granting traverse rights level by level from the
+    volume root down to the workspace was tried once, hoping to fix
+    powershell's location along the way. It was a disaster --
+    `SetNamedSecurityInfoW` applied to a directory **recomputes inheritance
+    across the entire subtree**, so calling it on `C:\Users\<user>` means
+    traversing the whole user profile; it hung for ten minutes, and killing it
+    partway left ACEs behind in the user's directory. The ancestor chain is not
+    a viable route; powershell's location is solved on the host side instead.
 
-- **`DETACHED_PROCESS` 会静默废掉嵌套进程的 stdout。** 为了躲开 conhost
-  混进 Job（见下条），一度用 `DETACHED_PROCESS` 代替 `CREATE_NO_WINDOW`。
-  结果：`cmd.exe` 自己照跑，`echo`/`type` 这些**内建**命令也照常有输出，
-  但 cmd 再去起的任何**外部**程序（node/ping/powershell）全部拿不到 stdout，
-  退出码 0 或 1，一个字节都不输出。必须用 `CREATE_NO_WINDOW`。
-- **`cmd.exe` 不用 `CommandLineToArgvW` 的引号规则。** 通用拼法把内嵌引号写成
-  `\"`，而 cmd 把反斜杠当普通字符。于是
-  `["cmd","/c","powershell -Command \"...\""]` 传过去，powershell 收到的是个
-  **字符串字面量**，它把命令原文回显出来、退出码 0，看起来"跑成功了"。
-  解法是 `cmd /s /c "<原样命令>"`：`/s` 让 cmd 只剥掉最外层一对引号，
-  中间一个都不转义。
-- **`apply_patch` 在 CRLF 文件上必然 "context not found"。** 补丁按 `\n` 分行，
-  而 Windows 上的文件是 CRLF，切出来的每行都多一个 `\r`，与补丁上下文逐字节
-  比较必然失败。而且就算匹配上，按 `\n` 回写会把整个文件的行尾改掉 ——
-  「改一行」产生全文件 diff。必须拆行时剥 `\r`、记住原风格、回写时还原。
-- **`SearchPath` 不能先试「不补扩展名」。** 照搬 `execvp` 的话，`cmd` 会先命中
-  `C:\MinGW\msys\1.0\bin\cmd` 这个无扩展名的 shell 脚本，而不是
-  `System32\cmd.exe`。要按 PATHEXT 顺序补扩展名。
-  同理，最小环境里的 PATH 必须把系统目录排在**最前面**，不是「在就行」——
-  排在 MSYS/chocolatey 的 shim 后面，跑的就不是模型以为的那个程序，
-  而且它会**成功**，只是行为不对。
-- **`.cmd` 文件里不能有非 ASCII —— 包括 `rem` 注释里的。** cmd.exe 按机器的
-  **OEM 代码页**（本机 936）读批处理文件，不是 UTF-8。UTF-8 的中文字节被当成
-  GBK 双字节重新配对，配对一错位，多字节序列中间的某个 ASCII 字节就暴露成了
-  命令分隔符 —— cmd 于是开始执行 `rem` 行的碎片。实测报的是
-  `'TH' is not recognized as an internal or external command`，
-  和真正的问题毫无关系。注释要写中文就写在 `.ps1` 里。
-- **AppContainer profile 在注册表里，`%LOCALAPPDATA%\Packages` 下的目录是按需才建的。**
-  被 kill -9 之后留下的 profile 要靠启动清扫回收，而第一版清扫器扫的是那个目录 ——
-  于是它**跑了，但什么都没清掉**，没有任何迹象。实测连跑七个会话之后
-  `Packages` 下一个 `hx-*` 目录都没有，而
-  `HKCU\...\AppContainer\Mappings` 里七条 moniker 全在。
-  权威列表是注册表；`DeleteAppContainerProfile` 两边都清。
-  smoke 的 H 节专门验这个：先强杀出一条残留（并**断言残留确实产生了**，
-  否则这条测试是空的），再起一个引擎看它有没有被收掉。
-- **`CreateProcess` 建 AppContainer 进程时必须有 `LOCALAPPDATA`。**
-  profile 落在 `%LOCALAPPDATA%\Packages\<name>` 下，少了这个变量直接失败，
-  报的还是极具误导性的 `ERROR_ENVVAR_NOT_FOUND(203)`「找不到输入的环境选项」——
-  错误码完全没提 AppContainer。只有它是必需的，`APPDATA`/`USERPROFILE` 都不用。
-- **"装了什么"和"沙箱里能用什么"是两件事。** 这是 Windows 版的
-  「`$HOME` 里的工具链跑不了」，而且更麻烦：判据是目标目录有没有给
-  **ALL APPLICATION PACKAGES** 授权，`icacls <dir>` 一看便知。
-  实测 `C:\Program Files\Git` 有（继承来的），而 **`C:\Program Files\nodejs`
-  没有** —— Node 安装程序断开了 ACL 继承，所以 `node` 在沙箱里起不来。
-  补 ACL 需要管理员权限。`%SystemRoot%\System32` 下的东西（`cmd`、
-  `powershell`）永远可用。
-- **Job 的 `ActiveProcesses` 不能拿来判断「还有没有孤儿」。** 两个坑：
-  直接子进程退出后仍留在名单里（我们还持有它的 HANDLE），
-  以及控制台程序会带一个 `conhost.exe` 进来。直接计数的话
-  `orphans_killed` 永远是 true，这个字段就废了。
-  要逐个 pid 确认是否真在跑，并按**完整镜像路径**排除 conhost。
+- **`DETACHED_PROCESS` silently breaks nested processes' stdout.** To dodge
+  conhost joining the Job (see below), `DETACHED_PROCESS` was briefly used in
+  place of `CREATE_NO_WINDOW`. The result: `cmd.exe` itself still ran and
+  **builtins** like `echo`/`type` still produced output, but any **external**
+  program cmd then started (node/ping/powershell) got no stdout at all -- exit
+  code 0 or 1, not one byte of output. `CREATE_NO_WINDOW` is required.
+- **`cmd.exe` does not use `CommandLineToArgvW`'s quoting rules.** The general
+  method writes an embedded quote as `\"`, while cmd treats a backslash as an
+  ordinary character. So passing `["cmd","/c","powershell -Command \"...\""]`
+  leaves powershell receiving a **string literal**, which it echoes back with
+  exit code 0, looking like it "ran fine". The fix is
+  `cmd /s /c "<command verbatim>"`: `/s` makes cmd strip only the outermost
+  pair of quotes and escape nothing in between.
+- **`apply_patch` is bound to report "context not found" on CRLF files.** The
+  patch format splits on `\n` while files on Windows are CRLF, so every line
+  cut out carries an extra `\r` and a byte-for-byte comparison against the
+  patch's context is bound to fail. And even when it matches, rejoining on
+  `\n` rewrites the whole file's line endings -- "change one line" produces a
+  whole-file diff. Strip `\r` when splitting, remember the original style, and
+  restore it when writing back.
+- **`SearchPath` must not try "no extension appended" first.** Copying `execvp`
+  over means `cmd` first hits `C:\MinGW\msys\1.0\bin\cmd`, an extensionless
+  shell script, rather than `System32\cmd.exe`. Append extensions in PATHEXT
+  order. Likewise, the minimal environment's PATH must put system directories
+  **first**, not merely "present" -- behind MSYS/chocolatey shims, what runs is
+  not the program the model thinks it is, and it **succeeds**, just with the
+  wrong behaviour.
+- **A `.cmd` file must contain no non-ASCII -- including inside `rem`
+  comments.** cmd.exe reads batch files in the machine's **OEM code page** (936
+  here), not UTF-8. UTF-8 bytes get re-paired as GBK double-bytes, the
+  alignment shifts, and an ASCII byte from the middle of a multi-byte sequence
+  surfaces as a command separator -- so cmd starts executing fragments of the
+  `rem` line. The observed report was
+  `'TH' is not recognized as an internal or external command`, entirely
+  unrelated to the real problem.
+- **AppContainer profiles live in the registry; the directory under
+  `%LOCALAPPDATA%\Packages` is created only on demand.** Profiles left behind
+  after a kill -9 are reclaimed by the startup sweep, and the first version of
+  that sweeper scanned the directory -- so it **ran and cleaned nothing up**,
+  with nothing to indicate it. Measured after seven consecutive sessions: not
+  one `hx-*` directory under `Packages`, while all seven monikers sat in
+  `HKCU\...\AppContainer\Mappings`.
+  The registry is the authoritative list; `DeleteAppContainerProfile` cleans
+  both. Section H of the smoke suite verifies exactly this: hard-kill to
+  produce residue (**asserting the residue really was produced**, or the test
+  is empty), then start another engine and check that it was collected.
+- **`CreateProcess` requires `LOCALAPPDATA` when creating an AppContainer
+  process.** The profile lives under `%LOCALAPPDATA%\Packages\<name>`, and
+  without that variable it fails outright -- with the thoroughly misleading
+  `ERROR_ENVVAR_NOT_FOUND(203)`, "The system could not find the environment
+  option that was entered", whose text never mentions AppContainer. It alone is
+  required; `APPDATA`/`USERPROFILE` are not.
+- **"What is installed" and "what works inside the sandbox" are two different
+  things.** This is the Windows version of "the toolchain in `$HOME` will not
+  run", and worse: the test is whether the target directory grants **ALL
+  APPLICATION PACKAGES**, which `icacls <dir>` shows at a glance.
+  Measured: `C:\Program Files\Git` has it (inherited), while **`C:\Program
+  Files\nodejs` does not** -- the Node installer breaks ACL inheritance, so
+  `node` cannot start inside the sandbox. Fixing the ACL requires administrator
+  rights. Things under `%SystemRoot%\System32` (`cmd`, `powershell`) always
+  work.
+- **A Job's `ActiveProcesses` cannot be used to decide "are there orphans".**
+  Two traps: the direct child stays on the list after exiting (we still hold
+  its HANDLE), and a console program drags a `conhost.exe` in. Counting
+  directly makes `orphans_killed` permanently true, which renders the field
+  useless. Confirm each pid individually, and exclude conhost by **full image
+  path**.
 
 ---
 
-## 附：让 hx 改自己（四轮实录）
+## Appendix: making hx modify itself (four rounds, as they happened)
 
-用 hx 驱动本地 27B 模型，给 hx 自己加 cgroup 支持。**四轮里前三轮全是 0 产出，而三次失败各有不同病因，其中三个是 harness 的真实缺陷。**
+hx was used to drive a local 27B model to add cgroup support to hx itself.
+**Three of the four rounds produced nothing at all, and each of the three
+failures had a different cause -- three of which were real defects in the
+harness.**
 
-| 轮次 | 结果 | 病因 | 修复 |
+| Round | Result | Cause | Fix |
 |---|---|---|---|
-| 1 | 8 条命令 fork 失败 | `RLIMIT_NPROC` 写死 256，而它数的是**线程**（本机 104 进程 = 667 线程） | 改成「当前用量 + 512」 |
-| 2 | 74 次读 / 0 产出 | read-compact-forget：16K 窗口装不下工作集，压缩把刚读的代码扔了 | 模型窗口 16K→32K |
-| 3 | 24 次系统调查 / 0 产出 | **沙箱读不到 `/sys/fs/cgroup`** —— 要改的东西正被沙箱挡着 | 新增 `extra_read_paths` |
-| 4 | **8 次补丁，任务完成** | — | 世界快照加 `step: N of M` + 产出压力 |
+| 1 | 8 commands failed to fork | `RLIMIT_NPROC` hardcoded to 256, while it counts **threads** (on this machine 104 processes = 667 threads) | Changed to "current usage + 512" |
+| 2 | 74 reads / nothing produced | read-compact-forget: a 16K window could not hold the working set, and compaction threw away the code just read | Model window 16K -> 32K |
+| 3 | 24 system investigations / nothing produced | **The sandbox could not read `/sys/fs/cgroup`** -- the thing to be modified was being blocked by the sandbox | Added `extra_read_paths` |
+| 4 | **8 patches, task completed** | — | The world snapshot gained `step: N of M`, plus pressure to produce |
 
-几条值得记下的：
+A few things worth recording:
 
-- **第 3 轮的死结是模型自己诊断出来的**（日志原话："Is /sys/fs/cgroup in the default read paths? No (only /sys/devices)"）。任务设计错误在人，不在模型。当 agent 要改的正是约束它自己的机制时，会出现自举死结。
-- **第 4 轮的关键是让模型看见预算。** 前三轮它表现得像时间无限——第 3 轮做了 24 次高质量系统调查却一个字节没写。世界快照里加一行 `step: 12 of 30`，再加一句"过半还没改过文件就停止调查、立刻动手"，读取 29→13、补丁 0→8。
-- **更紧的约束产出更好**：`--max-steps` 从 40 **降到** 30 反而成了。
-- 模型交出的代码有个我没想到的细节：写完 `pids.max` 要**读回校验**——"文件存在不等于控制器已下发"。
-- review 时我修了它两处：探测在成功的机器上会把 `+pids +memory` 永久留在父 cgroup（现在只还原自己加的）；探测与会话的 cgroup 同名会互删（现在分别叫 `hx-probe-<pid>` / `hx-session-<pid>`）。
+- **Round 3's deadlock was diagnosed by the model itself** (from the log: "Is
+  /sys/fs/cgroup in the default read paths? No (only /sys/devices)"). The task
+  design was the human's error, not the model's. When an agent has to modify
+  the very mechanism constraining it, a bootstrap deadlock appears.
+- **Round 4's key was letting the model see its budget.** In the first three
+  rounds it behaved as though time were unlimited -- round 3 performed 24
+  high-quality system investigations and wrote not one byte. Adding a line of
+  `step: 12 of 30` to the world snapshot, plus "if past halfway with no file
+  modified, stop investigating and start working", took reads from 29 to 13 and
+  patches from 0 to 8.
+- **Tighter constraints produced better results**: `--max-steps` **lowered**
+  from 40 to 30 is what made it work.
+- The code the model produced contained a detail its author had not thought of:
+  after writing `pids.max`, read it back to verify -- "the file existing does
+  not mean the controller was delegated".
+- Two things were fixed during review: the probe permanently left
+  `+pids +memory` on the parent cgroup of machines where it succeeded (it now
+  restores only what it added); and the probe's cgroup shared a name with the
+  session's, so they deleted each other (they are now `hx-probe-<pid>` /
+  `hx-session-<pid>`).
 
 ---
 
 ## License
 
-引擎 vendor 了 [nlohmann/json](https://github.com/nlohmann/json)（MIT）。
-宿主依赖 Hono（MIT）、zod（MIT）、tsx / TypeScript（MIT / Apache-2.0）。
+The engine vendors [nlohmann/json](https://github.com/nlohmann/json) (MIT).
+The host depends on Hono (MIT), zod (MIT), and tsx / TypeScript (MIT /
+Apache-2.0).

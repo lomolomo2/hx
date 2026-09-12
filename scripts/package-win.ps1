@@ -1,19 +1,23 @@
-# 打一个 Windows 可执行包。
+# Build a Windows executable package.
 #
 #   pwsh scripts\package-win.ps1 -Version v0.2.0
 #
-# 产物：dist\hx-windows-x64-<version>.zip，解开就能用，不需要克隆仓库。
+# Output: dist\hx-windows-x64-<version>.zip -- unpack and it works, with no
+# need to clone the repository.
 #
-# 包里有什么：
-#   hx.cmd / hx.ps1     启动器（同一份，自己认得出是发布包还是工作树）
-#   hxd.exe             引擎，原生二进制，无运行时依赖
-#   host\hx-host.mjs    宿主，esbuild 打成单文件
-#   README.md LICENSE   装法与用法
+# What is in the package:
+#   hx.cmd / hx.ps1     the launchers (the same files, which recognise for
+#                       themselves whether this is a release or a working tree)
+#   hxd.exe             the engine: a native binary with no runtime dependencies
+#   host\hx-host.mjs    the host, bundled to a single file by esbuild
+#   README.md LICENSE   how to install and use it
 #
-# ★ 为什么宿主不做成 .exe：它是 JS，要变成独立二进制得塞进一整个 Node
-#   运行时（40MB 起，而且每次 Node 出安全更新都得重新发一遍）。引擎才是
-#   必须原生的那一半 —— 沙箱是它建的。宿主依赖系统装的 Node 20+，
-#   这一条在 README 和启动器里都写清楚，而不是让它在运行时莫名其妙地失败。
+# ★ Why the host is not made into an .exe: it is JS, and turning it into a
+#   standalone binary means embedding a whole Node runtime (40MB and up, plus a
+#   re-release every time Node ships a security fix). The engine is the half
+#   that has to be native -- it is what builds the sandbox. The host depends on
+#   a system Node 20+, and that is stated plainly in the README and in the
+#   launcher rather than left to fail mysteriously at runtime.
 param(
   [string]$Version = "",
   [switch]$SkipBuild
@@ -34,45 +38,47 @@ Write-Host "version : $Version"
 Write-Host "staging : $staging"
 Write-Host ""
 
-# ---------------------------------------------------------------- 引擎
+# ---------------------------------------------------------------- engine
 if (-not $SkipBuild) {
-  Write-Host "== 构建引擎 ==" -ForegroundColor Cyan
+  Write-Host "== building the engine ==" -ForegroundColor Cyan
   pwsh -NoProfile -File (Join-Path $repo "engine\build-win.ps1")
   if ($LASTEXITCODE -ne 0) { throw "engine build failed" }
 }
 $hxd = Join-Path $repo "engine\build\hxd.exe"
 if (-not (Test-Path $hxd)) { throw "hxd.exe not found: $hxd" }
 
-# ★ 发的东西必须自己先验一遍。--self-test 退出码 0 = 这台机器上有真沙箱；
-#   拿一个连自检都过不去的二进制去发布，等于把"有沙箱"这句话的举证责任
-#   推给了用户。
+# ★ Whatever gets shipped must be verified first. --self-test exit code 0 =
+#   this machine has a real sandbox; releasing a binary that cannot even pass
+#   its own self-test pushes the burden of proving "there is a sandbox" onto
+#   the user.
 Write-Host ""
-Write-Host "== 自检（发布前必须过）==" -ForegroundColor Cyan
+Write-Host "== self-test (must pass before release) ==" -ForegroundColor Cyan
 & $hxd --self-test | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "hxd --self-test exited $LASTEXITCODE -- refusing to package" }
 Write-Host "  self-test OK" -ForegroundColor Green
 
-# ---------------------------------------------------------------- 宿主
+# ---------------------------------------------------------------- host
 Write-Host ""
-Write-Host "== 打包宿主 ==" -ForegroundColor Cyan
+Write-Host "== bundling the host ==" -ForegroundColor Cyan
 $esbuild = Join-Path $repo "host\node_modules\.bin\esbuild.cmd"
-if (-not (Test-Path $esbuild)) { throw "esbuild 不在：先在 $repo\host 里跑一次 npm install" }
+if (-not (Test-Path $esbuild)) { throw "esbuild is missing: run npm install once in $repo\host" }
 
 if (Test-Path $staging) { [IO.Directory]::Delete($staging, $true) }
 New-Item -ItemType Directory -Force -Path (Join-Path $staging "host") | Out-Null
 
-# --packages=bundle 把 hono/zod 一起打进来，解包后不需要 npm install。
-# --external:node:* 留给 Node 自己的内置模块。
-# ★ `--outfile=(Join-Path ...)` 会被 PowerShell 拆成**两个**参数，
-#   esbuild 于是看到两个输入文件，报 'Must use "outdir" when there are
-#   multiple input files' —— 和真正的问题毫无关系。先拼成字符串再传。
+# --packages=bundle pulls hono/zod in too, so no npm install is needed after
+# unpacking. --external:node:* leaves Node's own built-ins alone.
+# ★ `--outfile=(Join-Path ...)` gets split by PowerShell into **two**
+#   arguments, so esbuild sees two input files and reports 'Must use "outdir"
+#   when there are multiple input files' -- entirely unrelated to the real
+#   problem. Build the string first, then pass it.
 $entry = Join-Path $repo "host\src\cli.ts"
 $outfile = Join-Path $staging "host\hx-host.mjs"
 & $esbuild $entry --bundle --platform=node --target=node20 --format=esm `
   "--outfile=$outfile" --external:node:* --log-level=warning
 if ($LASTEXITCODE -ne 0) { throw "esbuild failed" }
 
-# ---------------------------------------------------------------- 组装
+# ---------------------------------------------------------------- assemble
 Copy-Item $hxd (Join-Path $staging "hxd.exe")
 Copy-Item (Join-Path $repo "hx.cmd") $staging
 Copy-Item (Join-Path $repo "hx.ps1") $staging
@@ -80,7 +86,7 @@ Copy-Item (Join-Path $repo "LICENSE") $staging
 Copy-Item (Join-Path $repo "docs\windows.md") (Join-Path $staging "README.md")
 
 Write-Host ""
-Write-Host "== 包内容 ==" -ForegroundColor Cyan
+Write-Host "== package contents ==" -ForegroundColor Cyan
 Get-ChildItem $staging -Recurse -File | ForEach-Object {
   $rel = $_.FullName.Substring($staging.Length + 1)
   Write-Host ("  {0,-24} {1,10:N0} bytes" -f $rel, $_.Length)

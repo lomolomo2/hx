@@ -13,7 +13,8 @@ export interface ModelMessage {
 
 export interface AssistantTurn {
   content: string | null;
-  /** 推理模型（Qwen3 / DeepSeek-R1 等）把思考过程单独放在这里。 */
+  /** Reasoning models (Qwen3 / DeepSeek-R1 and the like) put their thinking
+   *  here, separately. */
   reasoning?: string;
   toolCalls: ToolCall[];
   finishReason?: string;

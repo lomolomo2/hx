@@ -1,9 +1,10 @@
-// 子进程环境的唯一构造点。
+// The single place a child process's environment is constructed.
 //
-// ★ 测试路径（--sandbox-exec）和生产路径（exec.start）必须用同一个函数：
-//   两者若各建一份，测试就会在一个真实会话里不存在的环境下通过。
-//   踩过一次：--sandbox-exec 没设 TMPDIR，于是 gcc 报
-//   "Cannot create temporary file in /tmp/"，而真实会话里一切正常。
+// ★ The test path (--sandbox-exec) and the production path (exec.start) must
+//   use the same function: build one each and the tests pass in an environment
+//   that does not exist in a real session. Been bitten once already:
+//   --sandbox-exec did not set TMPDIR, so gcc reported "Cannot create
+//   temporary file in /tmp/" while everything was fine in a real session.
 #pragma once
 
 #include <map>
@@ -12,7 +13,8 @@
 
 namespace hx {
 
-// 不继承宿主 environ：环境变量是最容易漏出凭据的通道。
+// Does not inherit the host's environ: environment variables are the easiest
+// channel through which credentials leak.
 std::vector<std::string> BuildMinimalEnv(const std::string& home, const std::string& tmpdir,
                                          const std::map<std::string, std::string>& overrides);
 

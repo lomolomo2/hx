@@ -2,18 +2,21 @@ import { truncateMiddle } from "../context/truncate.js";
 import { shellCommand, shellName } from "../platform.js";
 import type { Tool } from "./types.js";
 
-// 40 万字符的输出喂给模型没有意义，只会烧光上下文。
-// 头留 4k（跑了什么、最初的错误），尾留 12k（最终状态、测试结论、堆栈）。
-const MAX_OUTPUT = 120_000; // 采集上限
+// Feeding 400,000 characters of output to the model is pointless and merely
+// burns the context. Keep 4k of the head (what ran, the first error) and 12k
+// of the tail (the final state, the test verdict, the stack trace).
+const MAX_OUTPUT = 120_000; // collection cap
 const HEAD_CHARS = 4_000;
 const TAIL_CHARS = 12_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
-// ★ 工具名固定是 "bash"（策略规则、presets、审批都按它匹配），
-//   但**描述里必须写清真正跑命令的是谁**。名字叫 bash、底下是 cmd.exe
-//   而不告诉模型，它就会一路发 POSIX 方言，然后每条都失败 ——
-//   而且失败信息是 cmd 的，模型根本看不出问题出在方言上。
-//   需要换 shell 就设 HX_SHELL（例如 Git Bash 的 bash.exe）。
+// ★ The tool name is fixed as "bash" (policy rules, presets and approval all
+//   match against it), but **the description must say who actually runs the
+//   command**. Call it bash, run cmd.exe underneath, and do not tell the
+//   model, and it will send POSIX dialect throughout and fail on every line --
+//   with cmd's error messages, from which the model cannot tell that the
+//   problem is the dialect.
+//   Set HX_SHELL for a different shell (Git Bash's bash.exe, say).
 const SHELL_OVERRIDE = process.env["HX_SHELL"];
 
 export const bashTool: Tool = {
@@ -51,9 +54,11 @@ export const bashTool: Tool = {
       item: { id, type: "command_execution", command: cmd, output: "", status: "in_progress" },
     });
 
-    // 具体包成什么 argv 由 platform 决定（bash -c / cmd /c / pwsh -Command）。
-    // 用 -c 而不是 -lc：登录 shell 会去读 ~/.profile，而 $HOME 在沙箱里不可读，
-    // 于是每条命令都会带一行 "Permission denied" 噪音。环境我们已显式构造好了。
+    // platform decides what argv this becomes (bash -c / cmd /c / pwsh
+    // -Command). Use -c rather than -lc: a login shell reads ~/.profile, and
+    // $HOME is unreadable inside the sandbox, so every command would carry a
+    // line of "Permission denied" noise. We construct the environment
+    // explicitly anyway.
     const { cell } = await ctx.engine.execStart(shellCommand(cmd, SHELL_OVERRIDE), { timeoutMs });
 
     let output = "";
@@ -94,7 +99,8 @@ export const bashTool: Tool = {
       },
     });
 
-    // ★ 失败也要把结果喂回模型，不能抛异常 —— 否则模型学不会"此路不通"
+    // ★ A failure is fed back to the model too, never thrown -- otherwise the
+    //   model never learns that this route does not work
     const header = `exit_code=${exitCode ?? "unknown"}${truncated ? " (output truncated)" : ""}`;
     return {
       content: `${header}\n${truncateMiddle(output, HEAD_CHARS, TAIL_CHARS)}`,

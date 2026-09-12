@@ -37,7 +37,7 @@ const char* ToString(NetMode m) {
 bool IsNotLooser(const Policy& cur, const Policy& next) {
   if (static_cast<int>(next.sandbox) > static_cast<int>(cur.sandbox)) return false;
   if (static_cast<int>(next.net) > static_cast<int>(cur.net)) return false;
-  // 额外只读路径同样只能收窄
+  // Extra read-only paths can likewise only narrow
   for (const auto& e : next.extra_read_paths) {
     bool found = false;
     for (const auto& c : cur.extra_read_paths) {
@@ -45,7 +45,7 @@ bool IsNotLooser(const Policy& cur, const Policy& next) {
     }
     if (!found) return false;
   }
-  // roots 只能是当前集合的子集
+  // roots can only be a subset of the current set
   for (const auto& r : next.roots) {
     bool found = false;
     for (const auto& c : cur.roots) {
@@ -57,12 +57,13 @@ bool IsNotLooser(const Policy& cur, const Policy& next) {
 }
 
 const std::vector<std::string>& DefaultSystemReadPaths() {
-  // 故意不含 /home、/root、/var/lib、/mnt：agent 要读的东西必须显式进 roots。
+  // /home, /root, /var/lib and /mnt are deliberately absent: anything the
+  // agent needs to read must enter roots explicitly.
   static const std::vector<std::string> kPaths = {
       "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt",
-      "/etc",            // resolv.conf / ssl 证书 / 时区
-      "/proc",           // 大量工具依赖
-      "/sys/devices",    // nproc 之类
+      "/etc",            // resolv.conf / ssl certificates / timezone
+      "/proc",           // a great many tools depend on it
+      "/sys/devices",    // nproc and the like
       "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
       "/dev/tty", "/dev/pts", "/dev/ptmx",
   };
@@ -78,9 +79,11 @@ const std::vector<std::string>& DefaultWritableDevices() {
 
 SeccompPlan PlanFor(const Policy& p) {
   SeccompPlan plan;
-  // Landlock 只管 TCP。要真的断网，Linux 侧必须在这里把 AF_INET/AF_INET6 的
-  // socket() 一起封掉 —— 否则 UDP（含 DNS）畅通无阻。
-  // Windows 侧不看这个字段：AppContainer 不给 internetClient 时 WFP 全挡。
+  // Landlock only covers TCP. To really be offline, the Linux side has to seal
+  // off socket() for AF_INET/AF_INET6 here as well -- otherwise UDP (DNS
+  // included) passes freely.
+  // The Windows side ignores this field: without internetClient granted to the
+  // AppContainer, WFP blocks everything.
   plan.block_inet = (p.net == NetMode::kDeny);
   plan.block_admin = (p.sandbox != SandboxMode::kDangerFullAccess);
   return plan;

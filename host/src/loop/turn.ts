@@ -1,9 +1,11 @@
-// Turn 循环。
+// The turn loop.
 //
-// ★ 阶段是显式状态，不是隐含约定：
-//     assembling → streaming → executing → settling
-//   "在工具执行到一半时压缩上下文"是真实存在的 bug 类别，和"在 DISPATCH_LEVEL
-//   访问分页内存"是同一种错误。把阶段建出来，这类错误在写的时候就没了。
+// ★ Phases are explicit state, not an implicit convention:
+//     assembling -> streaming -> executing -> settling
+//   "Compacting the context while a tool is mid-execution" is a real class of
+//   bug, and the same kind of error as "touching paged memory at
+//   DISPATCH_LEVEL". Build the phases out and that class of error disappears
+//   at the point of writing.
 import type { ModelClient, ModelMessage } from "../model/types.js";
 import type { SandboxReport, ThreadEvent, Usage } from "../protocol/events.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -26,17 +28,18 @@ export interface AgentOptions {
   allowedTools?: Set<string>;
   onEvent?: (e: ThreadEvent) => void;
   compaction?: Partial<CompactionSettings>;
-  /** 策略规则。后匹配者胜，所以用户规则应排在默认规则之后。 */
+  /** Policy rules. Last match wins, so user rules belong after the defaults. */
   rules?: Rule[];
-  /** ask 时如何征求同意。不提供则 ask 等价于 deny。 */
+  /** How consent is sought on ask. Without one, ask is equivalent to deny. */
   approval?: ApprovalHandler;
-  /** hxd 路径。子 agent 会用它另起一个引擎进程（上下文隔离）。 */
+  /** Path to hxd. A subagent uses it to start a separate engine process
+   *  (context isolation). */
   enginePath?: string;
-  /** 当前嵌套深度，由父 agent 传入 */
+  /** The current nesting depth, passed in by the parent agent */
   depth?: number;
-  /** 最大嵌套深度。到顶后 task 工具不再可用。 */
+  /** Maximum nesting depth. At the cap the task tool is no longer available. */
   maxDepth?: number;
-  /** 一轮里最多派多少个子 agent */
+  /** How many subagents may be dispatched in one turn */
   maxSubagents?: number;
 }
 
@@ -74,17 +77,19 @@ export class Agent {
     this.#rules = [...(opts.rules ?? [])];
   }
 
-  /** 会话内的临时授权也是一条规则，追加在最后所以优先级最高。 */
+  /** A temporary in-session grant is a rule too, appended last so it has the
+   *  highest precedence. */
   get rules(): readonly Rule[] {
     return this.#rules;
   }
 
   /**
-   * 请求中断。
+   * Request an interrupt.
    *
-   * 在阶段边界生效，而不是当场掐断 —— 工具执行到一半强行中止会留下
-   * 半完成的副作用，而引擎那边并不知情。已经在跑的命令交给引擎的超时与
-   * exec.kill 收尾。
+   * It takes effect at a phase boundary rather than cutting in immediately --
+   * forcibly aborting a tool mid-execution leaves half-finished side effects
+   * the engine knows nothing about. Commands already running are wound up by
+   * the engine's timeout and exec.kill.
    */
   abort(): void {
     this.#aborted = true;
@@ -95,7 +100,8 @@ export class Agent {
     return this.#aborted;
   }
 
-  /** 本轮真正会暴露给模型的工具名。策略隐藏与深度上限都体现在这里。 */
+  /** The tool names actually exposed to the model this turn. Both policy
+   *  hiding and the depth cap show up here. */
   get availableTools(): string[] {
     return [...this.#visibleTools()].sort();
   }
@@ -110,7 +116,8 @@ export class Agent {
     return this.#sandbox;
   }
 
-  /** 策略里被无差别禁掉的工具，直接不出现在工具清单里（access mask 模型）。 */
+  /** Tools the policy denies outright simply do not appear in the tool list
+   *  (the access-mask model). */
   #canSpawn(): boolean {
     const depth = this.opts.depth ?? 0;
     const maxDepth = this.opts.maxDepth ?? 2;
@@ -125,8 +132,9 @@ export class Agent {
   }
 
   /**
-   * 执行前的策略闸门。返回 null 表示放行，返回字符串表示拦下并把这段话喂回模型。
-   * ★ 只能在 executing 阶段调用。
+   * The policy gate, before execution. Returning null allows it; returning a
+   * string blocks it and feeds that text back to the model.
+   * ★ May only be called during the executing phase.
    */
   async #gate(toolName: string, args: Record<string, unknown>): Promise<string | null> {
     this.#requirePhase("executing", "policy gate");
@@ -152,7 +160,8 @@ export class Agent {
     this.#emit({ type: "approval.requested", id: req.id, tool: toolName, preview });
     this.#log("event", { type: "approval_requested", ...req });
 
-    // 没有 handler 时 ask 等价于 deny：没人能回答却放行，等于规则不存在
+    // With no handler, ask is equivalent to deny: allowing something nobody
+    // can answer is the same as the rule not existing
     const decision = this.opts.approval ? await this.opts.approval(req) : "deny";
 
     this.#emit({ type: "approval.resolved", id: req.id, decision });
@@ -160,7 +169,8 @@ export class Agent {
 
     if (decision === "deny") return denialMessage(toolName, preview);
     if (decision === "allow_always") {
-      // 追加在规则末尾 —— 后匹配者胜，于是同样的调用之后不再打扰用户
+      // Appended at the end of the rules -- last match wins, so the same call
+      // stops bothering the user from now on
       for (const s of subjects.length > 0 ? subjects : ["*"]) {
         this.#rules.push({ permission: toolName, pattern: s, action: "allow" });
       }
@@ -178,10 +188,12 @@ export class Agent {
     }
   }
 
-  /** 两条流分离：给模型的进 response_item，给人的进 event。 */
+  /** The two streams stay separate: what the model sees goes to response_item,
+   *  what people see goes to event. */
   #log(type: "response_item" | "event" | "compacted", payload: unknown): void {
     void this.engine.logAppend({ type, payload }).catch(() => {
-      /* 日志不该拖垮主流程；引擎侧失败已在 stderr 报告 */
+      /* logging must not drag down the main path; engine-side failures are
+         already reported on stderr */
     });
   }
 
@@ -247,7 +259,8 @@ export class Agent {
       }
       // ---------- assembling ----------
       this.#phase = "assembling";
-      // 让模型看见自己的预算 —— 看不见预算就不会收敛（实测：三次跑完 40 步、0 产出）
+      // Let the model see its own budget -- without it, it does not converge
+      // (measured: three runs went the full 40 steps and produced nothing)
       this.#world.step = { current: step + 1, max: maxSteps };
       await this.#maybeCompact();
       const messages = buildPrompt({ world: this.#world, history: this.#history });
@@ -266,7 +279,8 @@ export class Agent {
       }
       usage.inputTokens += assistant.usage.inputTokens;
       usage.outputTokens += assistant.usage.outputTokens;
-      // 用真实 usage 校准估算比值 —— 下一轮的压缩判断就更准
+      // Calibrate the estimation ratio against real usage -- the next turn's
+      // compaction decision is then more accurate
       this.#est.calibrate(this.#est.chars(messages), assistant.usage.inputTokens);
 
       if (assistant.reasoning) {
@@ -276,7 +290,8 @@ export class Agent {
         });
       }
 
-      // 助手消息必须原样回灌（含 tool_calls），否则模型会重复调同一个工具
+      // The assistant message must be fed back verbatim (tool_calls included),
+      // or the model calls the same tool again
       this.#history.push({
         role: "assistant",
         content: assistant.content,
@@ -294,8 +309,10 @@ export class Agent {
         this.#phase = "settling";
         const text = assistant.content ?? "";
 
-        // 推理模型可能把 token 全花在思考上，content 是空的。
-        // 那不是"回答完了"，是"被截断了" —— 提醒一次再继续，别把空串当成答案。
+        // A reasoning model may spend all its tokens thinking and leave
+        // content empty. That is not "the answer is finished", it is "this was
+        // truncated" -- nudge once and continue rather than treating an empty
+        // string as the answer.
         if (text.trim() === "") {
           this.#history.push({
             role: "user",
@@ -329,7 +346,7 @@ export class Agent {
         if (!tool) {
           content = `unknown tool: ${call.name}`;
         } else if (this.opts.allowedTools && !this.opts.allowedTools.has(call.name)) {
-          // 理论上不该发生：被禁的工具根本不在清单里
+          // Should not happen in theory: a denied tool is not in the list at all
           content = `tool ${call.name} is not permitted in this session`;
         } else {
           let args: Record<string, unknown> = {};
@@ -349,7 +366,7 @@ export class Agent {
             const result = await tool.execute(args, ctx);
             content = result.content;
           } catch (e) {
-            // ★ 工具失败也要喂回去，绝不抛穿循环
+            // ★ A tool failure is fed back too, and never thrown through the loop
             content = `tool ${call.name} failed: ${(e as Error).message}`;
           }
         }
@@ -364,12 +381,15 @@ export class Agent {
   }
 
   /**
-   * 派一个子 agent。
+   * Dispatch a subagent.
    *
-   * ★ 三条硬规矩：
-   *   1. 权限取交集（policy/intersect.ts）—— 子 agent 不可能比父 agent 权限大
-   *   2. 另起一个引擎进程 + 独立 rollout —— 上下文不共享，只回传结论
-   *   3. 回传内容包上 <subagent_result trust="data">，声明它是数据不是指令
+   * ★ Three hard rules:
+   *   1. Permissions are intersected (policy/intersect.ts) -- a subagent can
+   *      never have more privilege than its parent
+   *   2. A separate engine process and its own rollout -- context is not
+   *      shared, only conclusions come back
+   *   3. What comes back is wrapped in <subagent_result trust="data">,
+   *      declaring it as data rather than instructions
    */
   async #spawnSubagent(req: SubagentRequest): Promise<string> {
     const maxSubagents = this.opts.maxSubagents ?? 4;
@@ -446,12 +466,14 @@ export class Agent {
       },
     });
 
-    // ★ 信任降级：子 agent 可能读到被注入的内容，它的回复不能当指令用
+    // ★ Trust downgrade: a subagent may have read injected content, so its
+    //   reply must never be treated as instructions
     const note = rejected.length > 0 ? `\n(note: the subagent asked for privileges it did not get: ${rejected.join("; ")})` : "";
     return `<subagent_result name="${req.name}" trust="data">\n${report}\n</subagent_result>${note}`;
   }
 
-  /** ★ 只能在 assembling 阶段调用：工具执行到一半改历史会撕裂状态。 */
+  /** ★ May only be called during assembling: rewriting history while a tool is
+   *  mid-execution tears the state apart. */
   async #maybeCompact(): Promise<void> {
     this.#requirePhase("assembling", "compaction");
     const plan = planCompaction(this.#history, this.#est, this.#compaction);
@@ -460,9 +482,10 @@ export class Agent {
     const toSummarize = this.#history.slice(1, plan.keepFrom);
     let summary: string;
     try {
-      // ★ 必须把原始任务一并交给摘要模型。
-      //   漏掉它时，模型在摘要里写下了 "The original task statement isn't in the
-      //   visible history"，然后丢掉目标、重新探索、陷入死循环。
+      // ★ The original task must be handed to the summarizing model as well.
+      //   With it missing, the model wrote "The original task statement isn't
+      //   in the visible history" into its summary, then dropped the goal,
+      //   started exploring again, and looped forever.
       const r = await this.model.complete(
         [
           this.#history[0] ?? { role: "user", content: "(task unavailable)" },
@@ -473,7 +496,8 @@ export class Agent {
       );
       summary = (r.content ?? "").trim();
     } catch (e) {
-      // 压缩失败不能让整轮失败：退化成"丢掉中段并如实说明"
+      // A failed compaction must not fail the whole turn: degrade to "drop the
+      // middle section and say so honestly"
       summary = `(summarization failed: ${(e as Error).message}; ${toSummarize.length} earlier messages were dropped)`;
     }
     if (summary === "") {
@@ -483,7 +507,8 @@ export class Agent {
     const { next, replaced } = applyCompaction(this.#history, plan.keepFrom, summary);
     const after = this.#est.estimate(next);
 
-    // ★ 压缩必须留下可审计的记录，而不是偷偷改历史
+    // ★ Compaction must leave an auditable record rather than quietly
+    //   rewriting history
     this.#log("compacted", {
       replaced_count: replaced.length,
       tokens_before: plan.estimatedTokens,

@@ -1,4 +1,5 @@
-// hxp v0 —— 协议类型与编解码。规范见 proto/hxp-v0.md
+// hxp v0 -- protocol types plus encoding and decoding. The spec is in
+// proto/hxp-v0.md
 #pragma once
 
 #include <string>
@@ -9,7 +10,7 @@ namespace hx {
 
 using json = nlohmann::json;
 
-// 单行上限，超限即拒（proto/hxp-v0.md §0）
+// Per-line cap; anything over it is rejected (proto/hxp-v0.md section 0)
 inline constexpr size_t kMaxLineBytes = 8u * 1024u * 1024u;
 
 namespace err {
@@ -25,7 +26,7 @@ inline constexpr const char* kSandboxUnavailable = "E_SANDBOX_UNAVAILABLE";
 inline constexpr const char* kInternal = "E_INTERNAL";
 }  // namespace err
 
-// 崩溃恢复语义，不是重试策略（proto/hxp-v0.md §1）
+// Crash-recovery semantics, not a retry policy (proto/hxp-v0.md section 1)
 enum class Replay { kNever, kSafe };
 
 struct Request {
@@ -38,14 +39,17 @@ struct Request {
 struct ParseError {
   std::string code;
   std::string message;
-  // id 可能已解析出来；解析不出时为空，此时响应无法关联，只能发事件
+  // The id may already have been parsed; empty when it could not be, in which
+  // case a response cannot be correlated and only an event can be sent
   std::string id;
 };
 
-// 解析一行。成功写入 out 并返回 true；失败写入 e 并返回 false。
+// Parse one line. On success writes to out and returns true; on failure writes
+// to e and returns false.
 //
-// 契约（proto/hxp-v0.md §5 参数捕获）：返回的 Request 持有 args 的**独立副本**，
-// 调用方此后不得再引用解析用的输入缓冲区。
+// The contract (proto/hxp-v0.md section 5, parameter capture): the returned
+// Request holds an **independent copy** of args, and the caller must not refer
+// to the input buffer used for parsing afterwards.
 bool ParseRequest(const std::string& line, Request* out, ParseError* e);
 
 json MakeOk(const std::string& id, json result);

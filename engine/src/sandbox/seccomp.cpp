@@ -30,9 +30,10 @@ constexpr uint32_t kExpectedArch = AUDIT_ARCH_AARCH64;
 #error "hx seccomp: unsupported architecture"
 #endif
 
-// 与"跑一个构建任务"无关，但很适合用来越狱的 syscall。
-// 返回 EPERM 而不是直接杀进程：工具拿到一个错误码能自己报告，
-// 直接 KILL 会变成一个没有解释的崩溃，模型只会反复重试。
+// Syscalls that have nothing to do with "running a build" but are well suited
+// to breaking out. They return EPERM rather than killing the process outright:
+// a tool that gets an error code can report it itself, whereas an outright
+// KILL becomes an unexplained crash and the model just retries repeatedly.
 const long kAdminSyscalls[] = {
     __NR_ptrace,       __NR_mount,        __NR_umount2,      __NR_pivot_root,
     __NR_chroot,       __NR_keyctl,       __NR_add_key,      __NR_request_key,
@@ -57,14 +58,16 @@ bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
   std::vector<sock_filter> prog;
   const auto emit = [&prog](sock_filter f) { prog.push_back(f); };
 
-  // 架构不符直接杀：否则 32 位兼容入口可以绕开按编号写死的过滤器
+  // Kill outright on an architecture mismatch: otherwise the 32-bit
+  // compatibility entry point can bypass a filter hardcoded by syscall number
   emit(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
   emit(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kExpectedArch, 1, 0));
   emit(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 
   emit(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
 
-  // 记录所有需要跳到 DENY 的指令下标，最后统一回填偏移
+  // Record the index of every instruction that needs to jump to DENY, and
+  // backpatch all the offsets at the end
   std::vector<size_t> to_deny;
 
   if (plan.block_admin) {
@@ -76,7 +79,7 @@ bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
 
   if (plan.block_inet) {
     // if (nr == socket) { load args[0]; if (domain == AF_INET || AF_INET6) deny; }
-    // 不是 socket 就跳过后面 3 条（load + 两次比较）
+    // Not socket: skip the following 3 instructions (the load and two comparisons)
     emit(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(__NR_socket), 0, 3));
     emit(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])));
     to_deny.push_back(prog.size());
@@ -90,10 +93,10 @@ bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
   const size_t deny_idx = prog.size();
   emit(BPF_STMT(BPF_RET | BPF_K, kDeny));
 
-  // 回填：jt 指向 DENY，jf 落到下一条
+  // Backpatch: jt points at DENY, jf falls through to the next instruction
   for (const size_t at : to_deny) {
     const size_t delta = deny_idx - at - 1;
-    if (delta > 255) {  // BPF 的跳转偏移只有 8 位
+    if (delta > 255) {  // BPF jump offsets are only 8 bits
       *err = "seccomp filter too long for 8-bit jumps";
       return false;
     }
@@ -106,13 +109,14 @@ bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
   fprog.len = static_cast<unsigned short>(prog.size());
   fprog.filter = prog.data();
 
-  // seccomp 要求进程已放弃提权能力（Landlock 那边也会设，重复设是幂等的）
+  // seccomp requires the process to have given up privilege escalation
+  // (Landlock sets this too; setting it twice is idempotent)
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     *err = std::string("prctl(PR_SET_NO_NEW_PRIVS): ") + ::strerror(errno);
     return false;
   }
   if (::syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0u, &fprog) != 0) {
-    // 老内核没有 seccomp(2)，退回 prctl 接口
+    // Older kernels lack seccomp(2); fall back to the prctl interface
     if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog) != 0) {
       *err = std::string("seccomp(SET_MODE_FILTER): ") + ::strerror(errno);
       return false;

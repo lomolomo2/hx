@@ -1,18 +1,20 @@
-# hxd 的 Windows 冒烟套件 —— engine/tests/escape/run.sh 的对位。
+# hxd's Windows smoke suite -- the counterpart of engine/tests/escape/run.sh.
 #
 #   pwsh engine\tests\windows\smoke.ps1 [-Engine <path>] [-Workspace <dir>]
 #
-# 照搬 escape/run.sh 的那条原则：既验「该拒的拒了」，也验「该放的必须放得通」。
-# README 记着这条教训 —— /dev/null 授权带错访问位、RLIMIT_NPROC 写死 256，
-# 两次都是逃逸套件全绿而实际工作全废。
+# It copies escape/run.sh's principle: verify both that what should be refused
+# is refused, and that what should pass gets through. The README records this
+# lesson -- granting /dev/null with the wrong access bits, and hardcoding
+# RLIMIT_NPROC to 256: both times the escape suite was green while the actual
+# work was entirely broken.
 #
-# 各节与 Linux 侧的对应：
-#   A 可用性      <- escape/run.sh 的「可用性」一节
-#   B 文件隔离    <- Landlock allow-list            -> AppContainer + ACE
-#   C 网络        <- Landlock(TCP) + seccomp(UDP)   -> AppContainer 能力集（一层覆盖两者）
-#   D 进程树      <- setsid + kill(-pgid) + 反复清扫 -> Job 对象（原子，无需清扫）
-#   E path_guard  <- 同一份代码，两边都跑
-#   F apply_patch <- 同上
+# How each section maps to the Linux side:
+#   A usability    <- escape/run.sh's "usability" section
+#   B file isolation <- Landlock allow-list           -> AppContainer + ACEs
+#   C network      <- Landlock(TCP) + seccomp(UDP)    -> AppContainer capabilities (one layer covers both)
+#   D process tree <- setsid + kill(-pgid) + sweeping -> Job objects (atomic, no sweeping)
+#   E path_guard   <- the same code, run on both
+#   F apply_patch  <- likewise
 #   G pty         <- forkpty                        -> ConPTY
 param(
   [string]$Engine = "",
@@ -63,114 +65,137 @@ function Check {
   else { $script:fail++; Write-Host ("  FAIL  " + $Name + "  " + $Detail) -ForegroundColor Red }
 }
 
-Write-Host "=== A. 可用性：该放的必须放得通 ==="
+Write-Host "=== A. usability: what should pass must get through ==="
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo usable"]'))
-Check "workspace-write 下能跑命令" ("$o" -match "usable")
+Check "commands run under workspace-write" ("$o" -match "usable")
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","type note.txt"]'))
-Check "能读 root 内的文件" ("$o" -match "hello from the workspace")
+Check "a file inside the root can be read" ("$o" -match "hello from the workspace")
 
-# ★ 这三条是补上来的，补的正是本套件曾经漏掉的那个洞。
+# ★ These three were added later, and they close exactly the hole this suite
+#   once had.
 #
-#   早先这里只测了 echo / type / 写文件，全绿；而 `dir` 在沙箱里是**全线失败**的
-#   —— AppContainer 读不了卷根，cmd 的 dir 要查卷信息，于是连列自己的工作区
-#   都报 "Access is denied"。实测拿真模型跑任务时，它 20 步全耗在
-#   "我的文件到底在哪"上。
+#   Earlier this only tested echo / type / writing files, all green, while
+#   `dir` failed **everywhere** inside the sandbox -- an AppContainer cannot
+#   read the volume root, and cmd's dir queries volume information, so even
+#   listing its own workspace reported "Access is denied". Measured with a real
+#   model, all 20 of its steps went on "where are my files".
 #
-#   这就是 README 那条教训本身：安全测试只验"该拒的拒了"，验不出"该放的没放"。
+#   This is the README's lesson itself: a security test verifies that the
+#   forbidden was refused, and cannot detect that the permitted was blocked.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","dir /b"]'))
-Check "能列工作区目录（cmd dir）" ("$o" -match "note\.txt")
+Check "the workspace directory can be listed (cmd dir)" ("$o" -match "note\.txt")
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","dir /b sub"]'))
-Check "能列子目录" ("$o" -match "deep\.txt")
+Check "a subdirectory can be listed" ("$o" -match "deep\.txt")
 
-# PowerShell 要先挂 PSDrive 才能把 location 切到工作区（Set-Location 直接用绝对路径
-# 会 Access is denied —— 它要访问父目录，而父链是不授权的）。宿主的 shellCommand
-# 给 pwsh 分支加的就是这一段，这里验它确实管用。
+# PowerShell has to mount a PSDrive before its location can move to the
+# workspace (Set-Location with an absolute path gives Access is denied -- it
+# needs the parent directory, and the ancestor chain is not granted). That is
+# exactly what the host's shellCommand prepends on the pwsh branch, and this
+# verifies it really works.
 $psFix = 'New-PSDrive -Name hx -PSProvider FileSystem -Root ([Environment]::CurrentDirectory) -Scope Global | Out-Null; Set-Location hx:; Get-ChildItem -Name'
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines ('["powershell","-NoProfile","-Command",' + ($psFix | ConvertTo-Json) + ']') 25000 12))
-Check "能列工作区目录（PowerShell + PSDrive）" ("$o" -match "note\.txt")
+Check "the workspace directory can be listed (PowerShell + PSDrive)" ("$o" -match "note\.txt")
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo written > out.tmp && type out.tmp"]'))
-Check "能写 root 内的文件" ("$o" -match "written")
+Check "a file inside the root can be written" ("$o" -match "written")
 
-# 会话私有 tmp：不给它，凡是要落临时文件的工具（编译器、打包器）都会莫名其妙地失败
+# The session-private tmp: without it, every tool that needs a temp file
+# (compilers, bundlers) fails for no visible reason
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo tmp-ok > %TEMP%\\probe.txt && type %TEMP%\\probe.txt"]'))
-Check "能写会话私有 tmp" ("$o" -match "tmp-ok")
+Check "the session-private tmp can be written" ("$o" -match "tmp-ok")
 
-# NUL 是 /dev/null 的对位：写它是空操作，不是安全边界。
-# 少了它，read-only 会话里每条命令都会被 "Access is denied" 噪音污染。
+# NUL is /dev/null's counterpart: writing to it is a no-op, not a security
+# boundary. Without it, every command in a read-only session gets polluted by
+# "Access is denied" noise.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo nul-ok > NUL && echo done"]'))
-Check "能写 NUL 设备" ("$o" -match "done")
+Check "the NUL device can be written" ("$o" -match "done")
 
 Write-Host ""
-Write-Host "=== B. 文件隔离：该拒的必须拒掉 ==="
+Write-Host "=== B. file isolation: what should be refused must be refused ==="
 
-# 这一条对应 README 里 `cat ~/.ssh/id_rsa` 返回 EACCES：
-# 不需要任何黑名单，用户 profile 只是没被授予 AppContainer SID 而已。
+# This corresponds to `cat ~/.ssh/id_rsa` returning EACCES in the README: no
+# blacklist is involved, the user profile simply was never granted to the
+# AppContainer SID.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","type %USERPROFILE%\\.ssh\\id_rsa 2>&1"]'))
-Check "读不到用户 profile 下的私钥" (-not ("$o" -match "PRIVATE KEY"))
+Check "a private key under the user profile cannot be read" (-not ("$o" -match "PRIVATE KEY"))
 
-# ★ 为了让 `dir` 能用，卷根上需要一条最小 ACE（只给遍历 + 读属性，
-#   **不给列内容**，不继承）。那是一次性的机器设置，不是引擎每次去打的
-#   —— 见 confine_win.cpp 的 CheckVolumeRoots。
-#   这两条盯着那个口子别变大：卷根和用户目录都必须列不出来。
-#   注意不能只匹配 "Access is denied" —— 早先 dir 对任何目录都报这个，
-#   于是这类断言会**因为全都坏掉而全绿**。要验的是"看不到真实内容"。
+# ★ For `dir` to work, the volume root needs one minimal ACE (traverse +
+#   read-attributes only, **not** list-contents, and not inherited). That is a
+#   one-time machine setup, not something the engine stamps on every run -- see
+#   CheckVolumeRoots in confine_win.cpp.
+#   These two keep watch that the opening does not widen: neither the volume
+#   root nor the user directory may be listable.
+#   Note that matching on "Access is denied" alone is not enough -- dir used to
+#   report that for every directory, so assertions of this kind would go
+#   **green precisely because everything was broken**. What must be verified is
+#   that the real contents are not visible.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","dir /b C:\\"]'))
-Check "列不了卷根 C:\ 的内容" (-not ("$o" -match "(?m)^\s*(Windows|Program Files|Users)\s*$"))
+Check "the contents of volume root C:\ cannot be listed" (-not ("$o" -match "(?m)^\s*(Windows|Program Files|Users)\s*$"))
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","dir /b C:\\Users"]'))
-Check "列不了 C:\Users" (-not ("$o" -match "(?m)^\s*(Public|Default)\s*$"))
+Check "C:\Users cannot be listed" (-not ("$o" -match "(?m)^\s*(Public|Default)\s*$"))
 
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo nope > C:\\Windows\\hx-escape.txt && echo WROTE"]'))
-Check "写不了 C:\Windows" (-not ("$o" -match "WROTE"))
+Check "C:\Windows cannot be written" (-not ("$o" -match "WROTE"))
 
 $o = Run-Hx -Lines (@(Open-Session -Sandbox "read-only") + (Exec-Lines '["cmd","/c","echo nope > ro.tmp && echo WROTE"]'))
-Check "read-only 下写不了 root" (-not ("$o" -match "WROTE"))
+Check "the root cannot be written under read-only" (-not ("$o" -match "WROTE"))
 
 Write-Host ""
-Write-Host "=== C. 网络：net=deny 是内核强制 ==="
+Write-Host "=== C. network: net=deny is kernel-enforced ==="
 
 $o = Run-Hx -Lines (@(Open-Session -Net "deny") + (Exec-Lines '["cmd","/c","ping -n 1 -w 3000 8.8.8.8"]' 20000 12))
-Check "net=deny 挡住出站" (-not ("$o" -match "Reply from 8\.8\.8\.8|来自 8\.8\.8\.8"))
+# ★ The non-English alternative below is deliberate and must not be "cleaned
+#   up": ping localizes its output, so on a zh-CN Windows a successful reply
+#   reads "来自 8.8.8.8" rather than "Reply from 8.8.8.8". Matching only the
+#   English form would make this assertion pass on a localized machine even
+#   when the network was NOT blocked -- a security test going green for the
+#   wrong reason.
+Check "net=deny blocks outbound traffic" (-not ("$o" -match "Reply from 8\.8\.8\.8|来自 8\.8\.8\.8"))
 
-# ★ 这一条在 Linux 上要靠 seccomp 封 AF_INET 才成立（Landlock 只管 TCP，
-#   UDP/DNS 是它的盲区）。Windows 这边不需要第二层：没有 internetClient 能力时
-#   WFP 在内核里把 TCP 和 UDP 一起挡掉。
+# ★ On Linux this only holds because seccomp blocks AF_INET (Landlock covers
+#   TCP only, with UDP/DNS its blind spot). Windows needs no second layer:
+#   without the internetClient capability, WFP blocks TCP and UDP alike in the
+#   kernel.
 $o = Run-Hx -Lines (@(Open-Session -Net "deny") + (Exec-Lines '["cmd","/c","nslookup example.com 8.8.8.8"]' 20000 12))
-Check "net=deny 挡住 UDP/DNS（Landlock 的盲区）" (-not ("$o" -match "Address:\s*93\.|Non-authoritative"))
+Check "net=deny blocks UDP/DNS (Landlock's blind spot)" (-not ("$o" -match "Address:\s*93\.|Non-authoritative"))
 
 Write-Host ""
-Write-Host "=== D. 进程树所有权 ==="
+Write-Host "=== D. process tree ownership ==="
 
-# orphans_killed 必须是个有信号量的字段。早先 GroupAlive 用 ActiveProcesses 计数，
-# 结果每条普通命令都报 true（直接子进程自己还在名单里，外加一个 conhost），
-# 这个信号就废了。见 exec/proc_win.cpp 与 spawn_win.cpp 的 DETACHED_PROCESS。
+# orphans_killed has to be a field that carries information. GroupAlive used
+# to count ActiveProcesses, and the result was true for every ordinary command
+# (the direct child is still on the list, plus a conhost), which made the
+# signal worthless. See exec/proc_win.cpp and DETACHED_PROCESS in
+# spawn_win.cpp.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","echo plain"]'))
 $orph = ([regex]'"orphans_killed":(true|false)').Match("$o").Groups[1].Value
-Check "无后台进程时 orphans_killed=false" ($orph -eq "false") "got=$orph"
+Check "orphans_killed=false when there is no background process" ($orph -eq "false") "got=$orph"
 
-# README 的坑：`cmd &` 的顶层 shell 会立刻正常退出，后台进程永远留在系统里。
-# start /b 是它在 Windows 上的等价物。
+# The README's trap: the top-level shell of `cmd &` exits normally and
+# immediately, leaving the background process on the system forever. start /b
+# is its Windows equivalent.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","start /b cmd /c ping -n 30 127.0.0.1 > NUL & echo spawned"]'))
 $orph = ([regex]'"orphans_killed":(true|false)').Match("$o").Groups[1].Value
-Check "start /b 的后台进程被收掉" ($orph -eq "true") "got=$orph"
+Check "a background process from start /b is collected" ($orph -eq "true") "got=$orph"
 
-# 不能用 ping 验超时：net=deny 下它会立刻报 "Unable to contact IP driver" 而退出，
-# 于是根本走不到超时分支。cmd /c pause 会一直等 stdin，才是真的挂住。
+# ping cannot be used to test timeouts: under net=deny it reports "Unable to
+# contact IP driver" and exits immediately, so the timeout branch is never
+# reached. cmd /c pause waits on stdin forever, which really does hang.
 $o = Run-Hx -Lines (@(Open-Session) + (Exec-Lines '["cmd","/c","pause"]' 2000 10))
-Check "超时会杀掉进程" ("$o" -match '"timed_out":true')
+Check "a timeout kills the process" ("$o" -match '"timed_out":true')
 
 Write-Host ""
-Write-Host "=== E. path_guard（引擎自己不在沙箱里，全靠它） ==="
+Write-Host "=== E. path_guard (the engine is not itself sandboxed, so everything rests on it) ==="
 
 $o = Run-Hx -Lines @((Open-Session), '{"id":"r","op":"fs.read","args":{"path":"../../../../../../Windows/win.ini"}}')
-Check "fs.read 挡住 .. 逃逸" ("$o" -match "E_PATH_ESCAPE")
+Check "fs.read blocks a .. escape" ("$o" -match "E_PATH_ESCAPE")
 
 $o = Run-Hx -Lines @((Open-Session), '{"id":"r","op":"fs.read","args":{"path":"C:\\Windows\\win.ini"}}')
-Check "fs.read 挡住绝对路径逃逸" ("$o" -match "E_PATH_ESCAPE")
+Check "fs.read blocks an absolute-path escape" ("$o" -match "E_PATH_ESCAPE")
 
 Write-Host ""
 Write-Host "=== F. apply_patch ==="
@@ -179,7 +204,7 @@ $patch = '*** Begin Patch\n*** Add File: made.txt\n+line one\n+line two\n*** End
 $patchLine = '{"id":"p","op":"fs.apply_patch","args":{"patch":"' + $patch + '"}}'
 $readLine = '{"id":"r","op":"fs.read","args":{"path":"made.txt"}}'
 $o = Run-Hx -Lines @((Open-Session), $patchLine, $readLine)
-Check "apply_patch 能建文件并读回" ("$o" -match "line one")
+Check "apply_patch creates a file and it reads back" ("$o" -match "line one")
 
 Write-Host ""
 Write-Host "=== G. pty (ConPTY) ==="
@@ -188,17 +213,20 @@ $l = @((Open-Session),
   '{"id":"e","op":"exec.start","args":{"cmd":["cmd","/c","echo pty-works"],"pty":true,"rows":24,"cols":80,"timeout_ms":15000}}')
 for ($i = 0; $i -lt 8; $i++) { $l += '{"id":"w' + $i + '","op":"exec.wait","args":{"cell":"c1","yield_ms":1500}}' }
 $o = Run-Hx -Lines $l
-Check "ConPTY 能跑命令" ("$o" -match "pty-works")
+Check "ConPTY runs a command" ("$o" -match "pty-works")
 
 Write-Host ""
-Write-Host "=== H. 卫生：被强杀之后的残留会被下一次启动清掉 ==="
+Write-Host "=== H. hygiene: residue from a hard kill is cleaned up by the next start ==="
 
-# ★ 这一节是补的，补的是"清理代码跑了但什么都没清掉"这种最难发现的失败。
+# ★ This section was added to close the hardest failure of all to notice:
+#   "the cleanup code ran and cleaned nothing up".
 #
-#   SweepStaleProfiles 第一版扫的是 %LOCALAPPDATA%\Packages，而
-#   CreateAppContainerProfile 只保证在注册表 Mappings 下登记一条 moniker，
-#   那个目录是按需才建的。实测连跑七个会话，Packages 下一个目录都没有、
-#   注册表里七条全在 —— 清扫器等于没写，而且没有任何迹象。
+#   The first version of SweepStaleProfiles scanned %LOCALAPPDATA%\Packages,
+#   while CreateAppContainerProfile only guarantees registering a moniker under
+#   the registry's Mappings; that directory is created only on demand.
+#   Measured across seven consecutive sessions: not one directory under
+#   Packages, and all seven entries in the registry -- the sweeper might as
+#   well not have been written, with nothing to indicate it.
 function Get-HxProfiles {
   $k = "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings"
   return @(Get-ChildItem $k -ErrorAction SilentlyContinue |
@@ -208,7 +236,8 @@ function Get-HxProfiles {
 
 $before = Get-HxProfiles
 
-# 开一个会话然后**强杀**引擎：析构函数不会跑，profile 必然留下。
+# Open a session and then **hard-kill** the engine: the destructor does not
+# run, so a profile is certain to be left behind.
 $killFile = Join-Path $env:TEMP "hx-smoke-kill.jsonl"
 $j = $ws -replace '\\', '\\\\'
 Set-Content -Path $killFile -Encoding utf8 -Value @(
@@ -223,14 +252,14 @@ Stop-Process -Id $victim.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
 $leaked = @(Get-HxProfiles | Where-Object { $before -notcontains $_ })
-Check "强杀之后确实留下了 profile（否则这条测试是空的）" ($leaked.Count -gt 0) "leaked=$($leaked.Count)"
+Check "the hard kill really did leave a profile (otherwise this test is empty)" ($leaked.Count -gt 0) "leaked=$($leaked.Count)"
 
-# 再起一个引擎：它的启动清扫应该把上面那条收掉。
+# Start another engine: its startup sweep should collect the one above.
 Run-Hx -Lines @((Open-Session)) | Out-Null
 Start-Sleep -Milliseconds 400
 $after = Get-HxProfiles
 $still = @($leaked | Where-Object { $after -contains $_ })
-Check "下一次启动把残留清掉了" ($still.Count -eq 0) "still=$($still -join ',')"
+Check "the next start cleaned the residue up" ($still.Count -eq 0) "still=$($still -join ',')"
 
 Write-Host ""
 Write-Host "pass=$($script:pass) fail=$($script:fail)"

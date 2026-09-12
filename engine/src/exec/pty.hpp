@@ -1,14 +1,17 @@
-// PTY 会话。
+// PTY sessions.
 //
-// 为什么需要它：管道版的 exec 只能「跑一条命令、拿全部输出」。真实工作里有一整
-// 类事情做不了 ——
-//   · REPL（python3 -i、node、psql）
-//   · 会反问的命令（git rebase -i、sudo、npm init）
-//   · 需要边看边决定要不要停的长任务
-// 实测 codex 的 write_stdin 被调用 1463 次、wait 224 次，约占其 shell 交互的四分之一。
+// Why they are needed: the pipe flavour of exec can only "run one command and
+// collect all the output". A whole class of real work is impossible that way --
+//   - REPLs (python3 -i, node, psql)
+//   - commands that ask questions back (git rebase -i, sudo, npm init)
+//   - long tasks you watch and decide whether to stop
+// Measured against codex: write_stdin called 1463 times and wait 224 times,
+// roughly a quarter of its shell interaction.
 //
-// 与管道版的差别只在「怎么连」：沙箱、rlimit、seccomp 的施加顺序完全一致，
-// 所以这里只负责把 pty 主从两端接好，安全策略仍然走 spawn.cpp 那条路。
+// The only difference from the pipe flavour is *how things are connected*: the
+// order in which sandbox, rlimit and seccomp are applied is identical, so this
+// file only wires up the pty master and slave ends, and the security policy
+// still goes through spawn.cpp.
 #pragma once
 
 #include <string>
@@ -37,18 +40,24 @@ struct PtySpawnResult {
   bool ok = false;
   Proc proc;
   /**
-   * 主端。读是子进程输出，写是喂给它的输入；不分 stdout/stderr ——
-   * 这一点两个平台一致，因为它是 pty 语义本身决定的。
+   * The master end. Reading gives the child's output, writing feeds it input;
+   * stdout and stderr are not separated -- that part is the same on both
+   * platforms, because pty semantics themselves dictate it.
    *
-   * ★ 但「主端是几条流」不一致，这是必须暴露在类型里的差异：
-   *     Linux   pty 主端就是**一个** fd，读写同一个 -> 两个字段相等
-   *     Windows ConPTY 要求调用方自己给两条管道（一进一出），
-   *             主端因此是**两个**独立句柄 -> 两个字段不等
-   *   engine.cpp 于是不能再假设 in_fd == out_fd（原来的 pty 分支就是这么写的），
-   *   关闭时也要分别处理，否则 Windows 上会漏掉一条管道、cell 永远不 EOF。
+   * ★ But *how many streams the master end is* differs, and that difference
+   *   has to be visible in the types:
+   *     Linux   the pty master is **one** fd, read and written alike
+   *             -> the two fields are equal
+   *     Windows ConPTY requires the caller to supply two pipes (one in, one
+   *             out), so the master end is **two** independent handles
+   *             -> the two fields differ
+   *   engine.cpp therefore can no longer assume in_fd == out_fd (which is how
+   *   the original pty branch was written), and has to close them separately
+   *   -- otherwise one pipe is missed on Windows and the cell never reaches
+   *   EOF.
    */
-  io::Fd master_out = io::kInvalid;  // 读：子进程输出
-  io::Fd master_in = io::kInvalid;   // 写：喂给子进程
+  io::Fd master_out = io::kInvalid;  // read: the child's output
+  io::Fd master_in = io::kInvalid;   // write: input fed to the child
   std::string error;
 };
 
@@ -56,11 +65,13 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req);
 
 #ifdef _WIN32
 /**
- * 关掉 ConPTY 伪控制台。
+ * Close the ConPTY pseudoconsole.
  *
- * ★ 必须在进程已经回收之后才调用：ClosePseudoConsole 会等附着其上的
- *   进程退出。进程还活着时调它，单线程事件循环就直接挂死在这里。
- *   所以生命周期挂在 ReleaseProc 上，而不是 cell 关流的时候。
+ * ★ Must only be called once the process has already been reaped:
+ *   ClosePseudoConsole waits for the processes attached to it to exit. Call it
+ *   while the process is still alive and the single-threaded event loop hangs
+ *   right here. That is why its lifetime hangs off ReleaseProc rather than the
+ *   point where the cell closes its streams.
  */
 void ClosePtyHandle(void* pcon);
 #endif

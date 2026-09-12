@@ -1,12 +1,13 @@
-# 全量回归（Windows）。与 test/all.sh 一一对应。
+# The full regression suite (Windows). Matches test/all.sh one for one.
 #
 #   pwsh test\all.ps1
 #
-# ★ 引擎那四个套件（escape / kill9 / pty / forkbomb）是 bash + python3 写的，
-#   在 Windows 上没有直接对位：它们探的是 Landlock / seccomp / RLIMIT 的行为。
-#   对应的验证搬到了 engine\tests\windows\smoke.ps1 —— 验的是同一批性质
-#   （该放的放得通、该拒的拒掉、进程树不外泄），只是问的是 AppContainer
-#   和 Job 对象。
+# ★ The four engine suites (escape / kill9 / pty / forkbomb) are written in
+#   bash + python3 and have no direct counterpart on Windows: they probe the
+#   behaviour of Landlock / seccomp / RLIMIT. The equivalent verification moved
+#   to engine\tests\windows\smoke.ps1 -- it checks the same properties (what
+#   should pass gets through, what should be refused is refused, the process
+#   tree does not leak), just by asking AppContainer and Job objects instead.
 $ErrorActionPreference = "Continue"
 Set-Location (Join-Path $PSScriptRoot "..")
 
@@ -29,19 +30,20 @@ function New-Workspace {
   return $d
 }
 
-Section "类型检查"
+Section "typecheck"
 npx tsc --noEmit; Report $LASTEXITCODE "typecheck"
 
-Section "架构约束"
-pwsh -NoProfile -File test\arch.ps1 | Out-Null; Report $LASTEXITCODE "host 不得直接碰 fs / 起进程"
+Section "architectural constraints"
+pwsh -NoProfile -File test\arch.ps1 | Out-Null; Report $LASTEXITCODE "host must not touch fs / start processes"
 
-Section "引擎：沙箱 / 进程树 / pty（Windows 冒烟）"
+Section "engine: sandbox / process tree / pty (Windows smoke)"
 pwsh -NoProfile -File ..\engine\tests\windows\smoke.ps1 -Engine $HXD | Select-Object -Last 1
-Report $LASTEXITCODE "AppContainer + Job 对象 + ConPTY"
+Report $LASTEXITCODE "AppContainer + Job objects + ConPTY"
 
-Section "端到端：多步任务"
+Section "end to end: a multi-step task"
 $WS = New-Workspace "e2e"
-# 夹具随平台变，见 test\fixtures.ts（那里写了为什么 Windows 上只能用 powershell）
+# Fixtures vary by platform; see test\fixtures.ts, which explains why only
+# powershell works on Windows
 Set-Content -Path (Join-Path $WS "calc.ps1") -Encoding utf8 -Value @(
   'function Add-Values($a, $b) {'
   '    return $a - $b'
@@ -56,22 +58,22 @@ Set-Content -Path (Join-Path $WS "test_calc.ps1") -Encoding utf8 -Value @(
 )
 npx tsx test\e2e.ts $WS $HXD | Select-Object -Last 2; Report $LASTEXITCODE "e2e"
 
-Section "上下文压缩"
+Section "context compaction"
 $WS = New-Workspace "compact"
 npx tsx test\compaction.ts $WS $HXD | Select-Object -Last 2; Report $LASTEXITCODE "compaction"
 
-Section "策略与审批"
+Section "policy and approval"
 $WS = New-Workspace "appr"; New-Item -ItemType Directory -Force -Path (Join-Path $WS "build") | Out-Null
 npx tsx test\approval.ts $WS $HXD | Select-Object -Last 2; Report $LASTEXITCODE "approval"
 
-Section "子 agent 与权限收窄"
+Section "subagents and permission narrowing"
 $WS = New-Workspace "sub"; Set-Content -Path (Join-Path $WS "f.txt") -Value "data" -Encoding utf8
 npx tsx test\subagent.ts $WS $HXD | Select-Object -Last 2; Report $LASTEXITCODE "subagent"
 
-Section "HTTP / SSE 服务"
+Section "HTTP / SSE service"
 $WS = New-Workspace "srv"; New-Item -ItemType Directory -Force -Path (Join-Path $WS "build") | Out-Null
 npx tsx test\server.ts $WS $HXD | Select-Object -Last 2; Report $LASTEXITCODE "server"
 
 Write-Host ""
-if ($script:fail -eq 0) { Write-Host "全部通过" -ForegroundColor Green } else { Write-Host "有失败项" -ForegroundColor Red }
+if ($script:fail -eq 0) { Write-Host "all passed" -ForegroundColor Green } else { Write-Host "failures present" -ForegroundColor Red }
 exit $script:fail

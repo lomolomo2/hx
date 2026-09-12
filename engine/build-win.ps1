@@ -1,14 +1,16 @@
-# 在 Windows 上构建 hxd.exe。
+# Build hxd.exe on Windows.
 #
-#   pwsh engine\build-win.ps1              # 增量构建（首次会自动 configure）
-#   pwsh engine\build-win.ps1 -Configure   # 强制重新 configure
-#   pwsh engine\build-win.ps1 -Clean       # 删掉 build 目录重来
+#   pwsh engine\build-win.ps1              # incremental build (configures automatically the first time)
+#   pwsh engine\build-win.ps1 -Configure   # force a reconfigure
+#   pwsh engine\build-win.ps1 -Clean       # delete the build directory and start over
 #
-# ★ 为什么需要这个脚本，而不是直接 `cmake -S . -B build`：
-#   ① MSVC 的 cl.exe 只有在开发者环境里才在 PATH 上 —— 必须先过 vcvars64.bat。
-#   ② 系统上装的 cmake 可能低于 CMakeLists 要求的 3.20（实测 3.17）。
-#      Visual Studio 自带了一份够新的 cmake 和 ninja，这里直接用它们，
-#      省得为了构建再去装一套工具链。
+# ★ Why this script exists rather than just `cmake -S . -B build`:
+#   1. MSVC's cl.exe is only on PATH inside a developer environment -- you have
+#      to go through vcvars64.bat first.
+#   2. The system's cmake may be older than the 3.20 CMakeLists requires
+#      (measured: 3.17). Visual Studio ships a new enough cmake and ninja, so
+#      this uses those directly and saves installing another toolchain just to
+#      build.
 param(
   [switch]$Configure,
   [switch]$Clean
@@ -18,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $engineDir = $PSScriptRoot
 $buildDir = Join-Path $engineDir "build"
 
-# ---- 找 Visual Studio ----
+# ---- locate Visual Studio ----
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) {
   throw "vswhere.exe not found. Install Visual Studio 2019 16.11+ with the C++ workload."
@@ -35,7 +37,8 @@ $cmExt  = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake  = Join-Path $cmExt "CMake\bin\cmake.exe"
 $ninja  = Join-Path $cmExt "Ninja\ninja.exe"
 
-# VS 没带 cmake/ninja 时退回 PATH 上的（那就得自己保证版本够新）
+# If VS ships no cmake/ninja, fall back to whatever is on PATH (in which case
+# the version is your responsibility)
 if (-not (Test-Path $cmake)) { $cmake = (Get-Command cmake -ErrorAction Stop).Source }
 if (-not (Test-Path $ninja)) { $ninja = (Get-Command ninja -ErrorAction Stop).Source }
 if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vs" }
@@ -48,7 +51,8 @@ Write-Host "cmake  : $cmake"
 Write-Host "build  : $buildDir"
 Write-Host ""
 
-# vcvars64.bat 只影响它自己那个 cmd 进程，所以配置和构建要串在同一条命令里。
+# vcvars64.bat only affects its own cmd process, so configure and build have to
+# be chained into one command.
 $steps = @()
 if ($needConfigure) {
   $steps += "`"$cmake`" -S `"$engineDir`" -B `"$buildDir`" -G Ninja " +

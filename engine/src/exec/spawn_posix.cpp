@@ -14,7 +14,7 @@
 namespace hx {
 namespace {
 
-// 子进程里出错只能 _exit，不能 return
+// An error in the child can only _exit; it must not return
 [[noreturn]] void ChildFail(const char* what, int code) {
   ::fprintf(stderr, "hxd: %s: %s\n", what, ::strerror(errno));
   ::_exit(code);
@@ -53,29 +53,31 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
   }
 
   if (pid == 0) {
-    // ---- 子进程 ----
-    // 自成进程组：超时或 kill 时能连整棵子树一起收掉（防 fork 炸弹逃逸）
+    // ---- child ----
+    // Its own process group: on timeout or kill the whole subtree can be
+    // collected together (which is what stops a fork bomb escaping)
     if (::setsid() < 0) ChildFail("setsid", 126);
 
     if (::dup2(in_pipe[0], STDIN_FILENO) < 0) ChildFail("dup2(stdin)", 126);
     if (::dup2(out_pipe[1], STDOUT_FILENO) < 0) ChildFail("dup2(stdout)", 126);
     if (::dup2(err_pipe[1], STDERR_FILENO) < 0) ChildFail("dup2(stderr)", 126);
-    // 其余管道端都带 O_CLOEXEC，execve 时自动关闭
+    // Every other pipe end carries O_CLOEXEC and closes automatically at execve
 
     if (!req.cwd.empty() && ::chdir(req.cwd.c_str()) != 0) ChildFail("chdir", 126);
 
-    // ★ 顺序：chdir → restrict_self → execve
+    // ★ Order: chdir -> restrict_self -> execve
     std::string err;
     if (!ApplyRestrictSelf(req.conf, &err)) {
       ::fprintf(stderr, "hxd: sandbox: %s\n", err.c_str());
-      ::_exit(126);  // 装不上沙箱就不执行
+      ::_exit(126);  // if the sandbox cannot be applied, do not execute
     }
     if (!ApplyLimits(req.limits, &err)) {
       ::fprintf(stderr, "hxd: rlimit: %s\n", err.c_str());
       ::_exit(126);
     }
-    // ★ seccomp 必须最后装：它会封掉一批 syscall，装早了会把
-    //   后续的 chdir/dup2/setrlimit 之类一起挡掉。
+    // ★ seccomp must be applied last: it blocks a set of syscalls, and applied
+    //   too early it would also block the chdir/dup2/setrlimit steps that
+    //   follow.
     if (!ApplySeccomp(req.seccomp, &err)) {
       ::fprintf(stderr, "hxd: seccomp: %s\n", err.c_str());
       ::_exit(126);
@@ -95,12 +97,12 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
     ChildFail("execvpe", 127);
   }
 
-  // ---- 父进程：留下自己该留的端，关掉对端 ----
+  // ---- parent: keep the ends that are ours, close the far ones ----
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);
   ::close(err_pipe[1]);
   r.ok = true;
-  r.proc.pid = pid;  // 子进程 setsid 过，pgid == pid
+  r.proc.pid = pid;  // the child called setsid, so pgid == pid
   r.in_fd = in_pipe[1];
   r.out_fd = out_pipe[0];
   r.err_fd = err_pipe[0];
@@ -123,11 +125,12 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
   }
 
   if (pid == 0) {
-    // ---- 子进程。这里之后的任何失败都必须 _exit，不能 return ----
+    // ---- child. Every failure past this point must _exit, never return ----
     //
-    // ★ 顺序：chdir → restrict_self → execve
-    //   Landlock 无法撤销已打开的 fd，所以 chdir 要在施加之前完成；
-    //   而 restrict_self 必须在 execve 之前，否则新程序不受任何约束。
+    // ★ Order: chdir -> restrict_self -> execve
+    //   Landlock cannot revoke already-open fds, so chdir has to finish before
+    //   it is applied; and restrict_self must come before execve, or the new
+    //   program runs under no constraints at all.
     if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
       ::fprintf(stderr, "hxd: chdir(%s): %s\n", cwd.c_str(), ::strerror(errno));
       ::_exit(126);
@@ -136,7 +139,8 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
     std::string err;
     if (!ApplyRestrictSelf(conf, &err)) {
       ::fprintf(stderr, "hxd: sandbox: %s\n", err.c_str());
-      ::_exit(126);  // 装不上沙箱就不执行 —— 绝不降级为无保护运行
+      ::_exit(126);  // if the sandbox cannot be applied, do not execute --
+                     // never degrade to running unprotected
     }
     if (!ApplyLimits(limits, &err)) {
       ::fprintf(stderr, "hxd: rlimit: %s\n", err.c_str());
@@ -164,7 +168,7 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
     ::_exit(127);
   }
 
-  // ---- 父进程 ----
+  // ---- parent ----
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0) {
     if (errno == EINTR) continue;

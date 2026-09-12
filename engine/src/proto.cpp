@@ -9,7 +9,7 @@ bool ParseRequest(const std::string& line, Request* out, ParseError* e) {
     return false;
   }
 
-  // id 先解析出来：后续任何错误都要能关联回请求
+  // Parse the id first: any later error still has to be correlated back to the request
   std::string id;
   if (auto it = j.find("id"); it != j.end() && it->is_string()) {
     id = it->get<std::string>();
@@ -34,7 +34,7 @@ bool ParseRequest(const std::string& line, Request* out, ParseError* e) {
       *e = {err::kBadArgs, "args must be an object", id};
       return false;
     }
-    req.args = *it;  // 深拷贝：参数捕获，见 proto.hpp 契约
+    req.args = *it;  // deep copy: parameter capture; see the contract in proto.hpp
   }
 
   if (auto it = j.find("replay"); it != j.end()) {

@@ -9,9 +9,10 @@
 
 namespace hx {
 
-// Launch 在 spawn_win.cpp 里，pty 与管道两条路径共用它 ——
-// 这与 Linux 侧「安全策略仍然走 spawn.cpp 那条路」是同一个安排：
-// 沙箱、Job、限额的施加只有一处实现，pty 只负责把两端接好。
+// Launch lives in spawn_win.cpp and is shared by the pty and pipe paths --
+// the same arrangement as "the security policy still goes through spawn.cpp"
+// on the Linux side: the sandbox, the Job and the limits are applied in
+// exactly one implementation, and the pty only wires up the two ends.
 namespace win_spawn {
 bool Launch(const std::vector<std::string>& argv, const std::string& cwd,
             const std::vector<std::string>& envp, const Confinement* conf, const Limits& limits,
@@ -25,12 +26,13 @@ using CreatePseudoConsoleFn = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPC
 using ClosePseudoConsoleFn = void(WINAPI*)(HPCON);
 
 /**
- * ★ 动态解析而不是直接调用。
+ * ★ Resolved dynamically rather than called directly.
  *
- *   ConPTY 是 Windows 10 1809（build 17763）才有的。静态链接的话，
- *   在更老的系统上整个 hxd.exe **加载不起来** —— 连 --self-test 都跑不了，
- *   于是 caps 里那句「pty: available=false」永远没机会被打印出来。
- *   探测要有意义，就不能让它的失败模式是「程序起不来」。
+ *   ConPTY only exists from Windows 10 1809 (build 17763). Linked statically,
+ *   the whole of hxd.exe **fails to load** on anything older -- even
+ *   --self-test cannot run, so the "pty: available=false" line in caps never
+ *   gets a chance to be printed. For probing to mean anything, its failure
+ *   mode must not be "the program will not start".
  */
 CreatePseudoConsoleFn GetCreate() {
   static CreatePseudoConsoleFn fn = [] {
@@ -68,19 +70,23 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
   }
   CreatePseudoConsoleFn create = GetCreate();
   if (create == nullptr) {
-    // 如实报「这台机器没有」，而不是悄悄退回管道模式 ——
-    // 退回去的话 REPL 会卡在等 tty 上，症状比直接报错难查十倍。
+    // Report honestly that this machine does not have it, rather than quietly
+    // falling back to pipe mode -- fall back and a REPL hangs waiting for a
+    // tty, a symptom ten times harder to diagnose than a plain error.
     r.error = "ConPTY unavailable: requires Windows 10 1809 or later";
     return r;
   }
 
-  // ConPTY 要调用方自己给两条管道：一条它读（子进程的输入），一条它写（输出）。
-  // 我们这一侧都要 overlapped 才能进事件循环，所以复用 CreatePipePair：
-  //   parent_reads=false -> 父端可写（喂输入），子端同步（交给 ConPTY 读）
-  //   parent_reads=true  -> 父端可读（收输出），子端同步（交给 ConPTY 写）
+  // ConPTY requires the caller to supply two pipes: one it reads (the child's
+  // input) and one it writes (the output). Our side of both must be overlapped
+  // to join the event loop, so CreatePipePair is reused:
+  //   parent_reads=false -> parent writable (feeds input), child end
+  //                         synchronous (handed to ConPTY to read)
+  //   parent_reads=true  -> parent readable (collects output), child end
+  //                         synchronous (handed to ConPTY to write)
   io::Fd in_fd = io::kInvalid, out_fd = io::kInvalid;
-  HANDLE conpty_reads = INVALID_HANDLE_VALUE;   // ConPTY 从这里读子进程的输入
-  HANDLE conpty_writes = INVALID_HANDLE_VALUE;  // ConPTY 往这里写子进程的输出
+  HANDLE conpty_reads = INVALID_HANDLE_VALUE;   // ConPTY reads the child's input from here
+  HANDLE conpty_writes = INVALID_HANDLE_VALUE;  // ConPTY writes the child's output here
 
   auto cleanup = [&] {
     if (in_fd != io::kInvalid) io::Close(in_fd);
@@ -111,10 +117,12 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
                                     INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE,
                                     INVALID_HANDLE_VALUE, pcon, &proc, &r.error);
 
-  // ★ 无论成败都要关掉我们手里的这两端。
-  //   ConPTY 已经各自复制了一份；我们不关的话，outputWrite 这一侧永远有
-  //   持有者，子进程退出后父端读不到 EOF —— cell 就永远不会 done。
-  //   这与 Linux 侧 fork 之后父进程必须关掉管道对端是同一个道理。
+  // ★ Close our copies of both ends whether this succeeded or failed.
+  //   ConPTY has already duplicated each of them; leave ours open and the
+  //   outputWrite side always has a holder, so the parent never sees EOF after
+  //   the child exits -- and the cell is never done.
+  //   Same reasoning as the parent having to close the far pipe ends after
+  //   fork on Linux.
   ::CloseHandle(conpty_reads);
   conpty_reads = INVALID_HANDLE_VALUE;
   ::CloseHandle(conpty_writes);
@@ -126,7 +134,7 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
     return r;
   }
 
-  proc.pty = pcon;  // 生命周期交给 ReleaseProc：进程回收之后才关
+  proc.pty = pcon;  // lifetime handed to ReleaseProc: closed only after the process is reaped
   r.ok = true;
   r.proc = proc;
   r.master_out = out_fd;

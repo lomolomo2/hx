@@ -1,9 +1,10 @@
 import { truncateMiddle } from "../context/truncate.js";
 import type { Tool } from "./types.js";
 
-// ★ 直接把 argv 数组交给引擎执行，不经过 shell。
-//   模型给的 pattern 里就算有 $(...) 或 ; rm -rf 也只是一个普通的正则字符串。
-//   如果这里拼成 `bash -c "grep ${pattern}"`，那就是一个注入口子。
+// ★ The argv array goes straight to the engine, never through a shell.
+//   Even if the model's pattern contains $(...) or `; rm -rf`, it is just an
+//   ordinary regex string. Assemble `bash -c "grep ${pattern}"` here instead
+//   and that is an injection hole.
 const SKIP_DIRS = ["node_modules", ".git", "build", "dist", "__pycache__", ".venv", "vendor"];
 
 export const grepTool: Tool = {
@@ -47,7 +48,7 @@ export const grepTool: Tool = {
         const r = await ctx.engine.execWait(cell, 1000, 65536);
         out += r.data;
         if (r.done) {
-          // grep 的退出码 1 表示"没有匹配"，不是错误
+          // grep's exit code 1 means "no matches", not an error
           if (r.exit_code !== 0 && r.exit_code !== 1 && out.trim() === "") {
             return { content: `grep exited ${r.exit_code}`, isError: true };
           }

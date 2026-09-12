@@ -1,11 +1,13 @@
-// 子 agent 的权限收窄。
+// Narrowing a subagent's permissions.
 //
-// ★ 单调不增（UIPI 模型，见 harness-windows-kernel-analogy.md §2.8）：
-//   子 agent 的权限集合必须是父 agent 的子集。用 intersect 而不是 merge ——
-//   merge 的语义是"合并两边的诉求"，只要子 agent 能往里加一条 allow，
-//   一个被注入的子 agent 就能给自己提权。
+// ★ Monotonically non-increasing (the UIPI model; see
+//   harness-windows-kernel-analogy.md section 2.8): a subagent's permission set
+//   must be a subset of its parent's. Use intersect, not merge -- merge means
+//   "combine what both sides asked for", and the moment a subagent can add one
+//   allow, an injected subagent can escalate its own privileges.
 //
-// Windows 里低完整性进程不能驱动高完整性进程的行为；这里是同一条规矩。
+// On Windows a low-integrity process cannot drive a high-integrity process's
+// behaviour; this is the same rule.
 import type { Rule } from "./rules.js";
 import { pathWithin } from "../platform.js";
 
@@ -35,25 +37,28 @@ function tighterSandbox(a: SandboxMode, b: SandboxMode): SandboxMode {
 }
 
 /**
- * 路径是否落在某个 root 之内（按路径分量边界判断）。
+ * Whether a path lies inside some root (judged on path-component boundaries).
  *
- * ★ 这不是字符串比较，是**权限判断**：它决定子 agent 申请的 root
- *   算不算父 root 的子集。Windows 上分隔符两可、大小写不敏感，
- *   按字节比的话子 agent 只要换个大小写就能"申请到"一个新 root。
- *   具体见 platform.ts。
+ * ★ This is not a string comparison, it is a **permission decision**: it
+ *   determines whether a root a subagent requested counts as a subset of the
+ *   parent's. On Windows the separator is ambiguous and case is insensitive,
+ *   so comparing bytes lets a subagent "obtain" a new root merely by
+ *   respelling the case. See platform.ts for the details.
  */
 const within = pathWithin;
 
 export interface IntersectResult {
   grant: Grant;
-  /** 被驳回的越权诉求，如实记录下来 —— 它是子 agent 被注入的早期信号。 */
+  /** Rejected over-reaching requests, recorded honestly -- they are an early
+   *  signal that a subagent has been injected. */
   rejected: string[];
 }
 
 export function intersect(parent: Grant, req: GrantRequest): IntersectResult {
   const rejected: string[] = [];
 
-  // 沙箱与网络：取更严的一侧，子 agent 放宽的诉求直接忽略
+  // Sandbox and network: take the stricter side; a subagent's request to
+  // loosen is simply ignored
   const sandbox = tighterSandbox(parent.sandbox, req.sandbox ?? parent.sandbox);
   if (req.sandbox && sandbox !== req.sandbox) {
     rejected.push(`sandbox "${req.sandbox}" is looser than parent "${parent.sandbox}"`);
@@ -61,7 +66,7 @@ export function intersect(parent: Grant, req: GrantRequest): IntersectResult {
   const net: NetMode = parent.net === "deny" ? "deny" : (req.net ?? parent.net);
   if (req.net === "allow" && net === "deny") rejected.push('net "allow" denied: parent is "deny"');
 
-  // 根目录：只能是父集合的子集
+  // Roots: only a subset of the parent's set
   let roots = parent.roots;
   if (req.roots && req.roots.length > 0) {
     const kept = req.roots.filter((r) => parent.roots.some((p) => within(r, p)));
@@ -71,8 +76,10 @@ export function intersect(parent: Grant, req: GrantRequest): IntersectResult {
     if (kept.length > 0) roots = kept;
   }
 
-  // 规则：父规则在前保持基线；子 agent 只能追加"更严"的规则。
-  // ★ 子 agent 提出的 allow 一律丢弃 —— 否则后匹配者胜会让它覆盖父级的 deny。
+  // Rules: the parent's come first and hold the baseline; a subagent may only
+  // append *stricter* rules.
+  // ★ Any allow a subagent proposes is discarded -- otherwise last-match-wins
+  //   would let it override the parent's deny.
   const rules: Rule[] = [...parent.rules];
   for (const r of req.rules ?? []) {
     if (r.action === "allow") {
@@ -82,7 +89,7 @@ export function intersect(parent: Grant, req: GrantRequest): IntersectResult {
     rules.push(r);
   }
 
-  // 工具集：与父级求交
+  // Tool set: intersected with the parent's
   let tools = parent.tools;
   if (req.tools) {
     const wanted = new Set(req.tools);
