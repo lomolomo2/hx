@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "sandbox/caps.hpp"
 
 #include "sandbox/cgroup.hpp"
@@ -72,6 +73,8 @@ std::string ProbeKernel() {
 
 }  // namespace
 
+bool HasRealSandbox(const Caps& c) { return c.landlock_abi > 0; }
+
 Caps DetectCaps() {
   Caps c;
   c.kernel = ProbeKernel();
@@ -108,3 +111,4 @@ json CapsToJson(const Caps& c) {
 }
 
 }  // namespace hx
+#endif  // !_WIN32

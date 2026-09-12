@@ -6,6 +6,7 @@ import { ToolRegistry, defaultTools } from "../src/tools/registry.js";
 import { SUMMARY_INSTRUCTION } from "../src/context/compact.js";
 import type { ThreadEvent } from "../src/protocol/events.js";
 import type { AssistantTurn, ModelMessage } from "../src/model/types.js";
+import { fillerCommand } from "./fixtures.js";
 
 const ws = process.argv[2];
 const hxd = process.argv[3] ?? "../engine/build/hxd";
@@ -23,7 +24,7 @@ const script = (msgs: ModelMessage[]): AssistantTurn => {
   }
   if (toolStep < 6) {
     const n = toolStep++;
-    return callTool(`c${n}`, "bash", { cmd: `python3 -c "print('STEP${n} filler line. ' * 300)"` });
+    return callTool(`c${n}`, "bash", { cmd: fillerCommand(n) });
   }
   return say("Done after several noisy steps.");
 };

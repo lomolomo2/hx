@@ -1,8 +1,15 @@
 #include "exec/cell.hpp"
 
-#include <ctime>
+#include "platform/platform.hpp"
 
 namespace hx {
+
+Cell::~Cell() {
+  // out_fd / err_fd 走 Engine::CloseCellFd（那里要同时摘掉 reactor 注册）；
+  // 到这里只剩可能还开着的 stdin 写端。
+  if (in_fd != io::kInvalid && in_fd != out_fd) io::Close(in_fd);
+  ReleaseProc(&proc);
+}
 
 void Cell::Append(const char* data, size_t len) {
   if (buf.size() >= kCellBufferCap) {
@@ -28,7 +35,7 @@ Cell* CellTable::Find(const std::string& id) {
   return it == cells_.end() ? nullptr : it->second.get();
 }
 
-Cell* CellTable::FindByFd(int fd) {
+Cell* CellTable::FindByFd(io::Fd fd) {
   for (auto& [id, c] : cells_) {
     if (c->out_fd == fd || c->err_fd == fd) return c.get();
   }
@@ -37,10 +44,6 @@ Cell* CellTable::FindByFd(int fd) {
 
 void CellTable::Erase(const std::string& id) { cells_.erase(id); }
 
-int64_t NowMs() {
-  struct timespec ts {};
-  ::clock_gettime(CLOCK_MONOTONIC, &ts);
-  return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
-}
+int64_t NowMs() { return platform::NowMs(); }
 
 }  // namespace hx

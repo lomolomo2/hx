@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "exec/spawn.hpp"
 
 #include <fcntl.h>
@@ -65,7 +66,7 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
 
     // ★ 顺序：chdir → restrict_self → execve
     std::string err;
-    if (!ApplyRestrictSelf(req.ruleset_fd, &err)) {
+    if (!ApplyRestrictSelf(req.conf, &err)) {
       ::fprintf(stderr, "hxd: sandbox: %s\n", err.c_str());
       ::_exit(126);  // 装不上沙箱就不执行
     }
@@ -99,7 +100,7 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
   ::close(out_pipe[1]);
   ::close(err_pipe[1]);
   r.ok = true;
-  r.pid = pid;
+  r.proc.pid = pid;  // 子进程 setsid 过，pgid == pid
   r.in_fd = in_pipe[1];
   r.out_fd = out_pipe[0];
   r.err_fd = err_pipe[0];
@@ -107,7 +108,7 @@ SpawnCellResult SpawnCell(const SpawnCellRequest& req) {
 }
 
 SpawnResult RunForeground(const std::vector<std::string>& argv, const std::string& cwd,
-                          const std::vector<std::string>& envp, int ruleset_fd,
+                          const std::vector<std::string>& envp, const Confinement* conf,
                           const SeccompPlan& seccomp, const Limits& limits) {
   SpawnResult r;
   if (argv.empty()) {
@@ -133,7 +134,7 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
     }
 
     std::string err;
-    if (!ApplyRestrictSelf(ruleset_fd, &err)) {
+    if (!ApplyRestrictSelf(conf, &err)) {
       ::fprintf(stderr, "hxd: sandbox: %s\n", err.c_str());
       ::_exit(126);  // 装不上沙箱就不执行 —— 绝不降级为无保护运行
     }
@@ -181,3 +182,4 @@ SpawnResult RunForeground(const std::vector<std::string>& argv, const std::strin
 }
 
 }  // namespace hx
+#endif  // !_WIN32

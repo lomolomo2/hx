@@ -35,8 +35,48 @@ cmake --build build -j8
 ./build/hxd --self-test          # 打印本机隔离能力，退出码 0 = 有真沙箱
 ```
 
-Linux only。需要内核启用 Landlock（`cat /sys/kernel/security/lsm` 里应有 `landlock`）。
-没有 Landlock 时 `--self-test` 退出码为 2，引擎会如实上报"无文件系统隔离"而不是假装安全。
+Linux 与 Windows。`--self-test` 的退出码在两个平台上是同一个意思：
+**0 = 这台机器上有真沙箱，2 = 没有**。没有时引擎会如实上报"无文件系统隔离"
+而不是假装安全。
+
+- **Linux** 需要内核启用 Landlock（`cat /sys/kernel/security/lsm` 里应有 `landlock`）。
+- **Windows** 需要 Windows 10 1809 或更新（AppContainer + ConPTY）。
+  用 MSVC 构建（VS2019 16.11 起，需 `/std:c++20`）：
+
+  ```powershell
+  cd engine
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  cmake --build build
+  .\build\hxd.exe --self-test
+  ```
+
+  典型输出（这台机器有全套隔离）：
+
+  ```json
+  {"platform":"windows","kernel":"10.0.26200",
+   "filesystem":{"available":true,"backend":"appcontainer"},
+   "network":{"available":true,"backend":"appcontainer-capabilities","covers_udp":true},
+   "limits":{"available":true,"backend":"job-object","nested_jobs":true,
+             "max_processes":true,"max_memory":true,
+             "max_file_bytes":false,"max_open_files":false},
+   "pty":{"available":true,"backend":"conpty"}}
+  ```
+
+  注意 `limits` 里那两个 `false`：Job 对象没有 `RLIMIT_FSIZE` / `RLIMIT_NOFILE`
+  的对位，引擎不假装设上了。详见「两个平台的对应关系」。
+
+  **一次性机器设置（要不要做由你决定）**：AppContainer 默认读不了卷根，
+  而 `dir` / `Get-ChildItem` 要查卷信息 —— 不加这条，沙箱里**列不了任何目录**
+  （读写文件、跑程序都不受影响）。引擎会在 `session.open` 的 warnings 里
+  如实提示，并给出确切命令。每个要当 workspace 的盘各做一次，**需要管理员**：
+
+  ```powershell
+  icacls C:\ /grant "*S-1-15-2-1:(S,X,RA)"
+  ```
+
+  只给「同步 + 遍历 + 读属性」，**不给列内容**、不继承 —— 所以 `dir C:\`
+  依然被拒。形状和 Windows 出厂就挂在 `C:\` 上的那条能力 ACE 一样。
+  撤销：`icacls C:\ /remove:g "*S-1-15-2-1"`。
 
 ### 跑一个任务
 
@@ -48,8 +88,39 @@ export HX_BASE_URL=http://127.0.0.1:8080/v1
 export HX_MODEL=qwen3.8-27b-uncensored
 export HX_CONTEXT_WINDOW=16384          # 必须与服务端 n_ctx 对齐
 
-npx tsx src/cli.ts --root /path/to/repo "把 tests 里失败的用例修好"
+npx tsx src/cli.ts --root /path/to/repo "把 tests 里失败的用例修好"   # 一次性
+npx tsx src/cli.ts --root /path/to/repo                             # 交互式
 ```
+
+不给任务且 stdin 是终端时进**交互模式**：同一个会话、同一份历史反复对话，
+`/help` `/tools` `/sandbox` `/exit`，跑到一半 Ctrl+C 在阶段边界中断当前一轮。
+非终端（管道、CI）下不会进 —— 那会立刻读到 EOF，看起来像"什么都没干"。
+
+### Windows：当成一条命令用
+
+仓库根的 `hx.ps1` / `hx.cmd` 是个启动器，把这个目录加进 `PATH` 之后：
+
+```powershell
+cd C:\path\to\your\repo
+hx                                  # 当前目录作工作区，进交互
+hx "把 tests 里失败的用例修好"         # 一次性
+hx -Net allow -Approval auto -MaxSteps 40 "..."
+```
+
+**敲 `hx`（走 `hx.cmd`），不要敲 `.\hx.ps1`。** 默认的 Windows 装机执行策略是
+`Restricted`，直接跑 `.ps1` 会被拒（`running scripts is disabled on this system`）。
+`hx.cmd` 带着 `-ExecutionPolicy Bypass` 起 pwsh，存在的理由就是这个 ——
+所以不需要为了用 hx 去改机器的执行策略。没装 PowerShell 7 时它退回
+`powershell.exe`。
+
+端点配置优先级 命令行 > 环境变量 > `~\.hx\config.json`：
+
+```json
+{ "baseUrl": "https://192.168.1.241/llm/v1", "model": "qwen3.8-27b-uncensored", "contextWindow": 32768 }
+```
+
+自签证书把 PEM 放到 `~\.hx\certs\llm-<主机名>.pem`，启动器会 `NODE_EXTRA_CA_CERTS`
+**只**信任它，而不是把整个进程的 TLS 校验关掉。
 
 ### 起服务
 
@@ -77,7 +148,8 @@ curl -X POST localhost:4100/session/s1/prompt -H 'content-type: application/json
 | `HX_RESERVE_TOKENS` | 4096 | 给回复留的余量 |
 | `HX_KEEP_RECENT_TOKENS` | 6144 | 末尾多少 token 保持原文 |
 | `HX_APPROVAL` | cautious | `auto` / `cautious` / `strict` |
-| `HX_ENGINE` | `../engine/build/hxd` | 引擎路径 |
+| `HX_ENGINE` | `../engine/build/hxd`（Windows 上是 `hxd.exe`） | 引擎路径 |
+| `HX_SHELL` | Linux `bash`，Windows `cmd` | `bash` 工具用哪个 shell。**改了它，工具描述里给模型看的方言名也跟着改** —— 名字叫 bash、底下跑 cmd 而不告诉模型，它会一路发 POSIX 命令然后每条都失败 |
 | `HX_SHOW_REASONING` | — | 设了就显示推理模型的思考摘要 |
 
 CLI 参数：`--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`。
@@ -98,7 +170,15 @@ CLI 参数：`--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`�
 
 ### 沙箱层做了什么
 
+下面按 Linux 写。Windows 上每一条的对位见「两个平台的对应关系」，
+机制不同但**性质相同**：都是 allow-list、都在内核里强制、都不靠黑名单。
+
 - **Landlock**：文件按 allow-list 授权。默认系统只读路径**不含 `$HOME`** —— 这就是 `cat ~/.ssh/id_rsa` 返回 EACCES 的全部原因，不需要任何黑名单。符号链接逃逸自动被挡（Landlock 在解析后的路径上判定）。
+  Windows 对位是 AppContainer：进程 token 带一个低权限 package SID，
+  只有 DACL 里明确授予了它的对象才放行。用户 profile 默认不授予，
+  于是 `type %USERPROFILE%\.ssh\id_rsa` 直接 ACCESS_DENIED —— 同一个机制。
+  符号链接/junction 逃逸由 `path_guard` 打开句柄后问内核要最终路径来挡
+  （`GetFinalPathNameByHandle`，等价于 `realpath`）。
 - **seccomp-bpf**：封掉 `AF_INET`/`AF_INET6` 的 `socket()`（Landlock 只管 TCP，UDP/DNS 是它的盲区），以及 `ptrace`/`mount`/`keyctl`/`bpf` 等与构建任务无关的 syscall。返回 EPERM 而非 KILL——工具能报告错误，模型才会换路走。
 - **rlimit**：`RLIMIT_NPROC` = **当前 task 数 + 512**（不能写死绝对值——它数的是**线程不是进程**，本机 104 进程对应 667 线程；曾经写死 256，结果沙箱里每次 fork 都失败）、`RLIMIT_FSIZE` 2 GiB、`RLIMIT_NOFILE` 4096。
 - **进程组即所有权**：cell 的直接子进程退出时，若进程组里还有成员，引擎会冻结（SIGSTOP）+ 清扫（SIGKILL）直到组为空。没有这一条，任何 `cmd &` 都会在系统里留下守护进程。
@@ -119,7 +199,48 @@ CLI 参数：`--root` `--sandbox` `--net` `--approval` `--max-steps` `--engine`�
   `available` 只说文件系统在，`usable` 才说限额装得上。普通用户会话里 hxd 与 shell 同处一个 scope，写 `cgroup.subtree_control` 会 `EBUSY`（cgroup v2 的"无内部进程"规则）。把引擎放进独立 scope（`systemd-run --user --scope -p Delegate=yes`）即可用上 —— 那是部署方式的选择，引擎不该自作主张。探测本身无副作用：只还原自己新启用的控制器，用户原有的不动。
   **注意 `Cgroup2Session` 尚未接进 spawn 路径**，目前只有探测与会话原语。
 - **`danger-full-access` 模式下没有内核强制**，只剩 `path_guard` 的软校验。
-- 仅 Linux。macOS Seatbelt 留了接口 seam，未实现。
+- Linux 与 Windows。macOS Seatbelt 留了接口 seam（`sandbox/confine.hpp`），未实现。
+
+---
+
+## 两个平台的对应关系
+
+安全模型本来就是照着 Windows 的 user/kernel 分界设计的（见开头「特权边界」那条），
+所以移到 Windows 上不是"找个近似物凑合"，而是回到它的原型。
+每一条的细节都写在对应源文件的注释里。
+
+| 要解决的问题 | Linux | Windows | 哪边更强 |
+|---|---|---|---|
+| 文件按 allow-list 授权 | Landlock ruleset | AppContainer SID + 目录 ACE | 平手 |
+| `$HOME` 默认不可读 | 不加进 ruleset | 用户 profile 不授予 package SID | 平手 |
+| 断网 | Landlock(TCP) **+** seccomp(AF_INET，补 UDP 盲区) | 不授予 `internetClient` 能力，WFP 内核拦截 | **Windows**：一层覆盖 TCP+UDP，没有盲区 |
+| 进程数上限 | `RLIMIT_NPROC`（按 UID、数线程） | Job `ActiveProcessLimit`（按 Job、数进程） | **Windows**：可写绝对值，不影响同用户其它进程 |
+| 内存上限 | 无（cgroup 未接进 spawn 路径） | Job `JobMemoryLimit` | **Windows** |
+| 单文件大小 / fd 数上限 | `RLIMIT_FSIZE` / `RLIMIT_NOFILE` | **无对位** | **Linux** |
+| 进程组即所有权 | `setsid` + `kill(-pgid)` + 反复清扫 | Job 对象，`TerminateJobObject` 原子终止 | **Windows**：没有"和 fork 速度赛跑"这回事 |
+| 引擎自己被 `kill -9` 后 | 子孙被 init 收养，继续活着 | `KILL_ON_JOB_CLOSE`，内核连带收干净 | **Windows** |
+| 交互式会话 | `forkpty` | ConPTY（`CreatePseudoConsole`） | 平手 |
+| 事件循环 | epoll | IOCP + overlapped 命名管道 | 平手 |
+| 降权的时机 | fork 后子进程 `landlock_restrict_self`，**顺序错了等于没做** | `CreateProcess` 时把 token 定死，子进程没有窗口期 | **Windows**：不存在顺序错误这一类 bug |
+
+### Windows 侧诚实的边界
+
+- **`RLIMIT_FSIZE` / `RLIMIT_NOFILE` 没有对位。** Job 对象不限单文件大小、
+  不限句柄数。`--self-test` 把这两项报成 `false`，`session_meta` 因此能看出
+  这次运行到底限住了什么。写爆磁盘只能靠内存上限 + 超时 + 审批兜底，不是内核强制。
+- **`exec.kill` 的 `TERM`/`INT`/`HUP`/`QUIT` 基本一定失败，这是对的。**
+  Windows 没有这些信号；最接近的 CTRL_BREAK 只能发给同一个控制台上的进程，
+  而 cell 有自己的控制台。送不到就返回 `killed:false`，
+  **绝不悄悄升级成强杀** —— 那会让调用方以为进程有机会清理，而它没有。
+  `KILL` 是精确的（`TerminateJobObject`）。
+- **单线程无锁这条性质打了个折扣。** 宿主（Node/libuv）给子进程的标准句柄是
+  **同步**句柄，进不了 IOCP，对它 `ReadFile` 就是阻塞。所以 Windows 上 stdio
+  由两个只搬字节的线程驱动（`io/io_win.cpp` 顶部有完整说明）。
+  **引擎状态仍然是单线程的** —— 那两个线程不碰 `cells_`/`waits_`/`policy_`
+  里的任何东西，竞态面被压到「一个缓冲 + 一把锁」。
+- **授权 roots 是在真实目录上加 ACE，这是对文件系统的持久修改。**
+  ACE 只授予本会话那个唯一的 AppContainer SID，`Confinement` 析构时撤销。
+  被 `kill -9` 时 ACE 会残留（profile 则由下次启动的扫描清掉）。
 
 ### 子 agent
 
@@ -173,7 +294,11 @@ Item 类型：`agent_message` `reasoning` `command_execution` `file_change` `fil
 ## 测试
 
 ```bash
-cd host && npm test          # 十一个套件
+cd host && npm test          # Linux：十一个套件
+```
+
+```powershell
+cd host; pwsh test\all.ps1   # Windows：七个套件
 ```
 
 | 套件 | 验什么 |
@@ -190,6 +315,14 @@ cd host && npm test          # 十一个套件
 | subagent.ts | 权限单调不增、上下文隔离、内容降级 |
 | server.ts | HTTP/SSE 全流程 + 经 HTTP 的审批 |
 
+Windows 上 `escape` / `kill9` / `pty` / `forkbomb` 这四个引擎套件没有直接对位
+（它们探的是 Landlock / seccomp / RLIMIT 的具体行为），换成了
+`engine/tests/windows/smoke.ps1`：**24 项，验的是同一批性质** ——
+该放的放得通、该拒的拒掉、进程树不外泄、超时杀得掉、pty 能跑、被强杀之后的残留下次启动清得掉，
+只是问的是 AppContainer 和 Job 对象。其中有一项是 Linux 侧验不了的：
+`net=deny` 能不能挡住 **UDP/DNS**（Landlock 的盲区，Linux 靠 seccomp 补，
+Windows 天然覆盖）。
+
 **两条经验**：
 
 1. 安全测试只验"该拒的拒了"，验不出"该放的没放"。`/dev/null` 授权带错访问位、`RLIMIT_NPROC` 写死 256 —— 两次都是逃逸套件全绿而实际工作全废。逃逸套件因此专门有一节「可用性：该放的必须放得通」。
@@ -202,13 +335,19 @@ cd host && npm test          # 十一个套件
 ```
 proto/hxp-v0.md            协议规范（先于实现；实现与它不符时，改的是实现）
 engine/
-  src/sandbox/             caps 探测 · landlock · seccomp · policy
-  src/exec/                spawn · pty · cell · env · rlimit
+  src/platform/            NowMs · 路径形状 · 文件原语（两平台各一份实现）
+  src/io/                  Reactor + 非阻塞流（Linux epoll / Windows IOCP）
+  src/sandbox/             caps 探测 · policy · confine（平台 seam）
+      landlock · seccomp · cgroup        —— Linux
+      confine_win（AppContainer + ACE）  —— Windows
+  src/exec/                spawn · pty · cell · env · rlimit · proc（进程树所有权）
   src/fs/                  path_guard（唯一把字符串变成路径的地方）· apply_patch
   src/log/                 rollout
-  src/engine.cpp           事件循环与 op 分发（单线程 epoll，无锁无竞态）
-  tests/                   escape · durability · pty
+  src/engine.cpp           事件循环与 op 分发（单线程 reactor，引擎状态无锁无竞态）
+  tests/                   escape · durability · pty · limits  —— Linux
+      windows/smoke.ps1                                        —— Windows
 host/
+  src/platform.ts          宿主侧的平台差异（引擎路径 · shell · 路径比较）
   src/protocol/            ThreadEvent / Item / hxp 类型
   src/engine/client.ts     唯一允许 spawn 引擎的文件
   src/tools/               bash read apply_patch glob grep task todo
@@ -216,7 +355,14 @@ host/
   src/policy/              rules · presets · approval · intersect
   src/loop/turn.ts         四阶段状态机
   src/server/              Hono + SSE
+  test/all.sh · all.ps1    两个平台各自的全量回归
+hx.ps1 · hx.cmd            Windows 启动器：加进 PATH 后在任意仓库里敲 `hx`
+try-hx.ps1                 Windows 试跑入口（-Caps / -Sandbox / -Repl / 离线任务）
 ```
+
+**平台切分的原则：整个文件按平台挑，不在文件里撒 `#ifdef`。**
+散落的 `#ifdef` 会让两条路径互相看不见，改一边忘一边；整文件切分至少保证
+两边的函数签名必须对得上，编译器会盯着。选择在 `engine/CMakeLists.txt` 里。
 
 `turn.ts` 的四个阶段是显式状态：`assembling → streaming → executing → settling`。
 "工具执行到一半触发上下文压缩"是真实的 bug 类别，和"在 `DISPATCH_LEVEL` 访问分页内存"是同一种错误——建成显式状态后，`PhaseError` 会在写错时当场抛出。
@@ -231,7 +377,100 @@ host/
 - **`bash -lc` 会读 `~/.profile`**，而 `$HOME` 不可读 → 每条命令带一行噪音。用 `bash -c`。
 - **`RLIMIT_NPROC` 数的是线程不是进程。** 绝不能写死绝对值：本机 104 个进程对应 667 个线程，写死 256 会让沙箱里每次 `fork` 都失败。
 - **cell 必须拥有它的进程组。** `bash -c 'cmd &'` 的顶层 bash 会立刻正常退出（`exit_code=0`），超时分支因此不触发，后台进程永远留在系统里。直接子进程退出时必须检查进程组是否还有成员。
+- **REPL 取输入不能每轮 `rl.question()`。** 它只在被调用的那一刻接一行：模型跑着的时候敲进来的东西 readline 照样读走，但没人接，于是无声丢掉（typeahead 全没）。管道喂输入更极端——readline 一口气读完整个管道，第一行之后全丢，然后 EOF 直接退出。正确做法是常驻 `'line'` 监听 + 队列，把"读"和"取"解耦。审批提问不会被这个监听抢走：readline 在 `question` 挂起期间不发 `'line'`。
+- **同一个 stdin 上不能同时活着两个 readline。** 会互相抢输入；先关掉的那个还会把已进缓冲区的字节一并吞掉。REPL 与审批提问必须共用一个。
 - **事件循环里不能有无界读循环、也不能阻塞写 stdout。** 前者会被高产出的子进程饿死，后者会被读得慢的宿主冻住 —— 两种都会让超时与回收全部停摆。
+
+### Windows 特有的（都踩过）
+
+前四条是同一类错误的四个变体：**冒烟用例恰好只覆盖了简单情况，于是套件全绿而实际工作全废**
+—— 和 README 上面那条「安全测试验不出该放的没放」是同一个病。
+
+- **AppContainer 读不了卷根，于是 `dir` 全线失败。** 这条最贵，因为它同时具备
+  「症状严重」和「症状误导」两个属性。
+  `icacls C:\` 里没有 ALL APPLICATION PACKAGES（数据盘如 `H:\` 更是一条
+  AppContainer 授权都没有），而 cmd 的 `dir` 会去查卷信息 —— 结果是连
+  `dir /b <自己的工作区>` 都报 "Access is denied"，而**同一个目录**用 .NET 的
+  `GetFileSystemEntries` 枚举完全正常，`type <文件>` 也完全正常。
+  `vol` 同样被拒；`powershell.exe` 校验不了 cwd，把 provider location 悄悄退回
+  `C:\`，于是所有 cmdlet 的相对路径都指错地方（而 .NET 的相对路径是对的 ——
+  同一个进程里两套相对路径语义）。
+  实测拿真模型跑任务：**20 步全耗在「我的文件到底在哪」上**，
+  `dir` 拒、`cd && dir` 拒、`Get-ChildItem` 拒，而 `fs.read` 明明读得到文件。
+  解法是在**卷根**上加一条最小 ACE：`(S,X,RA)` —— 同步 + 遍历 + 读属性，
+  **不给 `FILE_READ_DATA`**（目录上它就是 `FILE_LIST_DIRECTORY`），不继承。
+  于是 `dir` 能用，而 `dir C:\` 依然被拒。`SYNCHRONIZE` 不能漏 ——
+  只给 `(X,RA)` 的话 `dir` 照样 "Access is denied"。
+  · 这是**一次性的机器设置，不是引擎每次去打的**。实测 `icacls C:\ /grant`
+    单次要 **16 秒**（卷根的子项要参与继承传播），而会话要 grant + revoke 两次，
+    于是每个 `session.open` 平白多出 30 多秒。引擎改成只**检查**，
+    缺了就发一条带确切修复命令的 warning，授权与否由用户决定：
+
+    ```
+    icacls C:\ /grant "*S-1-15-2-1:(S,X,RA)"
+    ```
+
+  · PowerShell 还要多一步：`Set-Location <绝对路径>` 依然 Access denied
+    （它要访问父目录）。可行的是 `New-PSDrive -Root <工作区>` 再
+    `Set-Location hx:` —— 宿主的 `shellCommand` 给 pwsh 分支自动加了这一段。
+  · 顺带一条**反面教训**：一度试过「从卷根到工作区逐级给遍历权」，
+    想顺便修好 powershell 的 location。结果是灾难 —— `SetNamedSecurityInfoW`
+    作用在一个目录上会**向整个子树重算继承**，在 `C:\Users\<user>` 上调它
+    等于遍历整个用户 profile，直接挂住十分钟，而且中途被杀会在用户目录上
+    留下 ACE。祖先链这条路不能走；powershell 的 location 改在宿主侧解决
+    （`shellCommand` 给它加一句 `Set-Location ([Environment]::CurrentDirectory)`）。
+
+- **`DETACHED_PROCESS` 会静默废掉嵌套进程的 stdout。** 为了躲开 conhost
+  混进 Job（见下条），一度用 `DETACHED_PROCESS` 代替 `CREATE_NO_WINDOW`。
+  结果：`cmd.exe` 自己照跑，`echo`/`type` 这些**内建**命令也照常有输出，
+  但 cmd 再去起的任何**外部**程序（node/ping/powershell）全部拿不到 stdout，
+  退出码 0 或 1，一个字节都不输出。必须用 `CREATE_NO_WINDOW`。
+- **`cmd.exe` 不用 `CommandLineToArgvW` 的引号规则。** 通用拼法把内嵌引号写成
+  `\"`，而 cmd 把反斜杠当普通字符。于是
+  `["cmd","/c","powershell -Command \"...\""]` 传过去，powershell 收到的是个
+  **字符串字面量**，它把命令原文回显出来、退出码 0，看起来"跑成功了"。
+  解法是 `cmd /s /c "<原样命令>"`：`/s` 让 cmd 只剥掉最外层一对引号，
+  中间一个都不转义。
+- **`apply_patch` 在 CRLF 文件上必然 "context not found"。** 补丁按 `\n` 分行，
+  而 Windows 上的文件是 CRLF，切出来的每行都多一个 `\r`，与补丁上下文逐字节
+  比较必然失败。而且就算匹配上，按 `\n` 回写会把整个文件的行尾改掉 ——
+  「改一行」产生全文件 diff。必须拆行时剥 `\r`、记住原风格、回写时还原。
+- **`SearchPath` 不能先试「不补扩展名」。** 照搬 `execvp` 的话，`cmd` 会先命中
+  `C:\MinGW\msys\1.0\bin\cmd` 这个无扩展名的 shell 脚本，而不是
+  `System32\cmd.exe`。要按 PATHEXT 顺序补扩展名。
+  同理，最小环境里的 PATH 必须把系统目录排在**最前面**，不是「在就行」——
+  排在 MSYS/chocolatey 的 shim 后面，跑的就不是模型以为的那个程序，
+  而且它会**成功**，只是行为不对。
+- **`.cmd` 文件里不能有非 ASCII —— 包括 `rem` 注释里的。** cmd.exe 按机器的
+  **OEM 代码页**（本机 936）读批处理文件，不是 UTF-8。UTF-8 的中文字节被当成
+  GBK 双字节重新配对，配对一错位，多字节序列中间的某个 ASCII 字节就暴露成了
+  命令分隔符 —— cmd 于是开始执行 `rem` 行的碎片。实测报的是
+  `'TH' is not recognized as an internal or external command`，
+  和真正的问题毫无关系。注释要写中文就写在 `.ps1` 里。
+- **AppContainer profile 在注册表里，`%LOCALAPPDATA%\Packages` 下的目录是按需才建的。**
+  被 kill -9 之后留下的 profile 要靠启动清扫回收，而第一版清扫器扫的是那个目录 ——
+  于是它**跑了，但什么都没清掉**，没有任何迹象。实测连跑七个会话之后
+  `Packages` 下一个 `hx-*` 目录都没有，而
+  `HKCU\...\AppContainer\Mappings` 里七条 moniker 全在。
+  权威列表是注册表；`DeleteAppContainerProfile` 两边都清。
+  smoke 的 H 节专门验这个：先强杀出一条残留（并**断言残留确实产生了**，
+  否则这条测试是空的），再起一个引擎看它有没有被收掉。
+- **`CreateProcess` 建 AppContainer 进程时必须有 `LOCALAPPDATA`。**
+  profile 落在 `%LOCALAPPDATA%\Packages\<name>` 下，少了这个变量直接失败，
+  报的还是极具误导性的 `ERROR_ENVVAR_NOT_FOUND(203)`「找不到输入的环境选项」——
+  错误码完全没提 AppContainer。只有它是必需的，`APPDATA`/`USERPROFILE` 都不用。
+- **"装了什么"和"沙箱里能用什么"是两件事。** 这是 Windows 版的
+  「`$HOME` 里的工具链跑不了」，而且更麻烦：判据是目标目录有没有给
+  **ALL APPLICATION PACKAGES** 授权，`icacls <dir>` 一看便知。
+  实测 `C:\Program Files\Git` 有（继承来的），而 **`C:\Program Files\nodejs`
+  没有** —— Node 安装程序断开了 ACL 继承，所以 `node` 在沙箱里起不来。
+  补 ACL 需要管理员权限。`%SystemRoot%\System32` 下的东西（`cmd`、
+  `powershell`）永远可用。
+- **Job 的 `ActiveProcesses` 不能拿来判断「还有没有孤儿」。** 两个坑：
+  直接子进程退出后仍留在名单里（我们还持有它的 HANDLE），
+  以及控制台程序会带一个 `conhost.exe` 进来。直接计数的话
+  `orphans_killed` 永远是 true，这个字段就废了。
+  要逐个 pid 确认是否真在跑，并按**完整镜像路径**排除 conhost。
 
 ---
 

@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "sandbox/cgroup.hpp"
 
 #include <sys/stat.h>
@@ -247,3 +248,4 @@ bool Cgroup2Session::AddPid(pid_t pid, std::string* err) {
 }
 
 }  // namespace hx
+#endif  // !_WIN32

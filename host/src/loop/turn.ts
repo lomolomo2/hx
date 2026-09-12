@@ -204,7 +204,7 @@ export class Agent {
       net: String(eff["net"]),
       enforced: Boolean(eff["enforced"]),
       netEnforced: Boolean(eff["net_enforced"]),
-      landlockAbi: Number(eff["landlock_abi"]),
+      backend: String(eff["backend"] ?? "none"),
       warnings: r.warnings ?? [],
     };
     this.#world = {

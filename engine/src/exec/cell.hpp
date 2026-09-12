@@ -5,13 +5,14 @@
 // 或远程机器，宿主和模型侧都不用改。
 #pragma once
 
-#include <sys/types.h>
-
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "exec/proc.hpp"
+#include "io/io.hpp"
 
 namespace hx {
 
@@ -20,14 +21,17 @@ inline constexpr size_t kCellBufferCap = 4u * 1024u * 1024u;
 
 struct Cell {
   std::string id;
-  pid_t pid = -1;
-  int out_fd = -1;  // 子进程 stdout 的读端
-  int err_fd = -1;  // 子进程 stderr 的读端
+  Proc proc;
+  io::Fd out_fd = io::kInvalid;  // 子进程 stdout 的读端
+  io::Fd err_fd = io::kInvalid;  // 子进程 stderr 的读端
 
   std::string buf;        // 尚未被 exec.wait 取走的输出
   size_t dropped = 0;     // 因超上限被丢弃的字节数
-  bool is_pty = false;  // pty 只有一个 fd，输出不分 stdout/stderr
-  int in_fd = -1;       // 管道版的 stdin 写端；pty 版与 out_fd 同为主端
+  bool is_pty = false;           // pty 的输出不分 stdout/stderr
+  io::Fd in_fd = io::kInvalid;   // stdin 写端。
+                                 // ★ 别假设 pty 时 in_fd == out_fd：Linux 的 pty 主端
+                                 //   确实是同一个 fd，ConPTY 却是**两条独立管道**。
+                                 //   关流时必须分别处理，见 Engine::CloseCellFd。
   bool exited = false;
   int exit_code = -1;
   int term_signal = 0;
@@ -40,15 +44,27 @@ struct Cell {
   // 给一小段时间把缓冲读干净，然后强制收口，否则这个 cell 永远不会 done。
   int64_t fd_close_deadline_ms = 0;
 
-  bool Finished() const { return exited && out_fd < 0 && err_fd < 0; }
+  bool Finished() const {
+    return exited && out_fd == io::kInvalid && err_fd == io::kInvalid;
+  }
   void Append(const char* data, size_t len);
+
+  /**
+   * ★ cell 被 exec.wait 回收时，内核对象必须一起还回去。
+   *   Windows 上尤其要紧：Job 句柄漏一个，KILL_ON_JOB_CLOSE 就永远不触发，
+   *   那棵子树会一直活到 hxd 退出为止 —— 正是「进程组即所有权」要防的事。
+   */
+  ~Cell();
+  Cell() = default;
+  Cell(const Cell&) = delete;
+  Cell& operator=(const Cell&) = delete;
 };
 
 class CellTable {
  public:
   Cell* Create(const std::string& id);
   Cell* Find(const std::string& id);
-  Cell* FindByFd(int fd);
+  Cell* FindByFd(io::Fd fd);
   void Erase(const std::string& id);
 
   std::map<std::string, std::unique_ptr<Cell>>& all() { return cells_; }

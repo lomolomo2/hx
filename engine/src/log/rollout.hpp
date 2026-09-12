@@ -9,6 +9,8 @@
 //   · 掉电级别的持久性需要 fsync，只在 Flush() 时做
 #pragma once
 
+#include "platform/platform.hpp"
+
 #include <cstdint>
 #include <string>
 
@@ -28,13 +30,13 @@ class Rollout {
   void Close();
 
   const std::string& path() const { return path_; }
-  bool is_open() const { return fd_ >= 0; }
+  bool is_open() const { return file_.valid(); }
   int64_t seq() const { return seq_; }
 
   static bool IsValidName(const std::string& name);
 
  private:
-  int fd_ = -1;
+  platform::AppendFile file_;
   std::string path_;
   int64_t seq_ = 0;
 };

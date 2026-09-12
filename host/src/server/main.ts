@@ -4,8 +4,9 @@ import { serve } from "@hono/node-server";
 
 import { createApp } from "./app.js";
 import { OpenAICompatClient } from "../model/openai_compat.js";
+import { defaultEnginePath } from "../platform.js";
 
-const DEFAULT_HXD = new URL("../../../engine/build/hxd", import.meta.url).pathname;
+const DEFAULT_HXD = defaultEnginePath("../../../engine/build/", import.meta.url);
 
 const argv = process.argv.slice(2);
 const portIdx = argv.indexOf("--port");

@@ -1,12 +1,10 @@
 #include "fs/apply_patch.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
+#include "platform/platform.hpp"
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <sys/stat.h>
 #include <string_view>
 
 #include "fs/path_guard.hpp"
@@ -15,96 +13,71 @@
 namespace hx {
 namespace {
 
-std::vector<std::string> SplitLines(const std::string& s) {
+/**
+ * 行尾风格。
+ *
+ * ★ 不处理 CRLF 的后果比想象中严重，两条都实测过：
+ *
+ *   ① **上下文永远匹配不上。** 补丁格式按 '\n' 分行，而 Windows 上绝大多数
+ *      文件是 CRLF —— 从文件里切出来的每一行都多一个尾随 '\r'，
+ *      与补丁里的上下文行逐字节比较必然失败。表现是 apply_patch 对
+ *      Windows 上任何一个 CRLF 文件都报 "context not found"，
+ *      而补丁本身完全正确。
+ *
+ *   ② **就算匹配上了，回写会改掉整个文件的行尾。** 按 '\n' 重新拼接
+ *      等于把 CRLF 文件整体转成 LF，于是「改了一行」产生一个全文件的 diff。
+ *      在 Windows 仓库里这足以淹没真正的改动。
+ *
+ *   所以：拆行时剥掉 '\r' 并记住原风格，拼回去时按原风格还原。
+ */
+enum class LineEnding { kLf, kCrLf };
+
+/** style 非空时回报这个文本原本的行尾风格（以第一个换行为准）。 */
+std::vector<std::string> SplitLines(const std::string& s, LineEnding* style = nullptr) {
+  if (style != nullptr) {
+    const size_t nl = s.find('\n');
+    *style = (nl != std::string::npos && nl > 0 && s[nl - 1] == '\r') ? LineEnding::kCrLf
+                                                                     : LineEnding::kLf;
+  }
   std::vector<std::string> out;
   size_t start = 0;
   while (start <= s.size()) {
     const size_t nl = s.find('\n', start);
     if (nl == std::string::npos) {
-      if (start < s.size()) out.push_back(s.substr(start));
+      if (start < s.size()) {
+        std::string last = s.substr(start);
+        if (!last.empty() && last.back() == '\r') last.pop_back();
+        out.push_back(std::move(last));
+      }
       break;
     }
-    out.push_back(s.substr(start, nl - start));
+    size_t len = nl - start;
+    if (len > 0 && s[start + len - 1] == '\r') --len;  // 剥掉 CRLF 的 '\r'
+    out.push_back(s.substr(start, len));
     start = nl + 1;
   }
   return out;
 }
 
-std::string JoinLines(const std::vector<std::string>& lines, bool trailing_newline) {
+std::string JoinLines(const std::vector<std::string>& lines, bool trailing_newline,
+                      LineEnding style) {
+  const char* eol = (style == LineEnding::kCrLf) ? "\r\n" : "\n";
   std::string out;
   for (size_t i = 0; i < lines.size(); ++i) {
     out += lines[i];
-    if (i + 1 < lines.size() || trailing_newline) out.push_back('\n');
+    if (i + 1 < lines.size() || trailing_newline) out += eol;
   }
   return out;
 }
 
+// 文件 I/O 全部走 platform：原子替换（临时文件 -> 落盘 -> rename）的语义
+// 两个平台一致，见 platform::WriteFileAtomic。
 bool ReadWholeFile(const std::string& path, std::string* out, std::string* err) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    *err = std::string("open: ") + ::strerror(errno);
-    return false;
-  }
-  out->clear();
-  char buf[65536];
-  while (true) {
-    const ssize_t n = ::read(fd, buf, sizeof(buf));
-    if (n > 0) {
-      out->append(buf, static_cast<size_t>(n));
-      continue;
-    }
-    if (n == 0) break;
-    if (errno == EINTR) continue;
-    *err = std::string("read: ") + ::strerror(errno);
-    ::close(fd);
-    return false;
-  }
-  ::close(fd);
-  return true;
+  return platform::ReadWholeFile(path, out, err);
 }
 
-// 写到同目录的临时文件再 rename：rename 本身是原子的，
-// 崩在中途要么是旧内容要么是新内容，不会出现半个文件。
 bool WriteAtomic(const std::string& path, const std::string& content, std::string* err) {
-  const size_t slash = path.find_last_of('/');
-  const std::string dir = (slash == std::string::npos) ? "." : path.substr(0, slash);
-  std::string tmpl = dir + "/.hx-tmp-XXXXXX";
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-
-  const int fd = ::mkstemp(buf.data());
-  if (fd < 0) {
-    *err = std::string("mkstemp: ") + ::strerror(errno);
-    return false;
-  }
-  const std::string tmp_path(buf.data());
-
-  size_t off = 0;
-  while (off < content.size()) {
-    const ssize_t n = ::write(fd, content.data() + off, content.size() - off);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      *err = std::string("write: ") + ::strerror(errno);
-      ::close(fd);
-      ::unlink(tmp_path.c_str());
-      return false;
-    }
-    off += static_cast<size_t>(n);
-  }
-  if (::fsync(fd) != 0) {
-    *err = std::string("fsync: ") + ::strerror(errno);
-    ::close(fd);
-    ::unlink(tmp_path.c_str());
-    return false;
-  }
-  ::close(fd);
-  ::chmod(tmp_path.c_str(), 0644);
-  if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
-    *err = std::string("rename: ") + ::strerror(errno);
-    ::unlink(tmp_path.c_str());
-    return false;
-  }
-  return true;
+  return platform::WriteFileAtomic(path, content, err);
 }
 
 struct Hunk {
@@ -255,7 +228,10 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
     p.rel_path = f.path;
 
     if (f.kind == "add") {
-      p.content = JoinLines(f.add_lines, /*trailing_newline=*/true);
+      // 新建的文件一律用 LF，两个平台一致。
+      // 理由是确定性：补丁本身就是 LF 的，跟着平台走会让同一个补丁在
+      // Linux 和 Windows 上产出不同字节的文件，测试和 diff 都会跟着漂。
+      p.content = JoinLines(f.add_lines, /*trailing_newline=*/true, LineEnding::kLf);
     } else if (f.kind == "delete") {
       // 不需要内容
     } else {
@@ -267,7 +243,9 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
         return r;
       }
       const bool had_trailing = !original.empty() && original.back() == '\n';
-      std::vector<std::string> cur_lines = SplitLines(original);
+      // 记住原文件的行尾风格，回写时照原样还原 —— 见 LineEnding 的注释。
+      LineEnding style = LineEnding::kLf;
+      std::vector<std::string> cur_lines = SplitLines(original, &style);
 
       size_t cursor = 0;
       for (const auto& h : f.hunks) {
@@ -284,7 +262,7 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
                          h.after.end());
         cursor = at + h.after.size();
       }
-      p.content = JoinLines(cur_lines, had_trailing);
+      p.content = JoinLines(cur_lines, had_trailing, style);
     }
     planned.push_back(std::move(p));
   }
@@ -293,9 +271,9 @@ ApplyPatchResult ApplyPatch(const std::string& patch_text, const std::string& ba
   for (const auto& p : planned) {
     std::string ferr;
     if (p.kind == "delete") {
-      if (::unlink(p.abs_path.c_str()) != 0) {
+      if (!platform::Unlink(p.abs_path)) {
         r.error_code = err::kInternal;
-        r.error = "unlink " + p.rel_path + ": " + ::strerror(errno);
+        r.error = "unlink " + p.rel_path;
         return r;
       }
     } else if (!WriteAtomic(p.abs_path, p.content, &ferr)) {

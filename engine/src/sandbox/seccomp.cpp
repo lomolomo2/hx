@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "sandbox/seccomp.hpp"
 
 #include <linux/audit.h>
@@ -49,15 +50,6 @@ const long kAdminSyscalls[] = {
 constexpr uint32_t kDeny = SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA);
 
 }  // namespace
-
-SeccompPlan PlanFor(const Policy& p) {
-  SeccompPlan plan;
-  // Landlock 只管 TCP。要真的断网，必须在这里把 AF_INET/AF_INET6 的
-  // socket() 一起封掉 —— 否则 UDP（含 DNS）畅通无阻。
-  plan.block_inet = (p.net == NetMode::kDeny);
-  plan.block_admin = (p.sandbox != SandboxMode::kDangerFullAccess);
-  return plan;
-}
 
 bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
   if (!plan.block_inet && !plan.block_admin) return true;
@@ -130,3 +122,4 @@ bool ApplySeccomp(const SeccompPlan& plan, std::string* err) {
 }
 
 }  // namespace hx
+#endif  // !_WIN32

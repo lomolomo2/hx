@@ -1,3 +1,4 @@
+#ifndef _WIN32
 #include "exec/pty.hpp"
 
 #include <fcntl.h>
@@ -41,7 +42,7 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
     }
 
     std::string err;
-    if (!ApplyRestrictSelf(req.ruleset_fd, &err)) {
+    if (!ApplyRestrictSelf(req.conf, &err)) {
       ::fprintf(stderr, "hxd: sandbox: %s\r\n", err.c_str());
       ::_exit(126);
     }
@@ -72,9 +73,12 @@ PtySpawnResult SpawnPty(const PtySpawnRequest& req) {
 
   // ---- 父进程 ----
   r.ok = true;
-  r.pid = pid;
-  r.master_fd = master;
+  r.proc.pid = pid;  // forkpty 内部已 setsid，pgid == pid
+  // Linux 的 pty 主端读写同一个 fd
+  r.master_out = master;
+  r.master_in = master;
   return r;
 }
 
 }  // namespace hx
+#endif  // !_WIN32

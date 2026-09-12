@@ -17,8 +17,6 @@
 //     它仍然只是缓解不是隔离；真正的按沙箱限额要靠 cgroup pids.max。
 #pragma once
 
-#include <sys/types.h>
-
 #include <cstdint>
 #include <string>
 
@@ -30,10 +28,24 @@ struct Limits {
   uint64_t max_file_bytes = 0;  // RLIMIT_FSIZE：防止写爆磁盘
   uint64_t max_open_files = 0;  // RLIMIT_NOFILE
   bool disable_core_dumps = true;
+
+  /**
+   * 整棵子树的内存上限（字节）。0 = 不设限。
+   *
+   * ★ Linux 侧目前**不生效**：这相当于 cgroup 的 memory.max，而 README
+   *   说得很清楚，Cgroup2Session 还没接进 spawn 路径。setrlimit 没有等价物
+   *   （RLIMIT_AS 限的是地址空间不是驻留内存，对现代运行时基本没用）。
+   *   Windows 侧生效：JOB_OBJECT_LIMIT_JOB_MEMORY 是按 Job 算的真实上限。
+   *   字段留在这里而不是藏进 Windows 私有结构，是为了让这处不对称
+   *   在类型上就看得见。
+   */
+  uint64_t max_job_memory_bytes = 0;
 };
 
+#ifndef _WIN32
 /** 统计该 UID 当前的 task 数（线程，不是进程）。失败返回 0。 */
-uint64_t CountUserTasks(uid_t uid);
+uint64_t CountUserTasks(unsigned uid);
+#endif
 
 /**
  * 算出本会话可用的上限：max_processes = 当前 task 数 + headroom。
@@ -46,7 +58,21 @@ Limits LimitsFor(uint64_t headroom = 512);
 /** 等价于 LimitsFor()，保留给不关心余量的调用方。 */
 Limits DefaultLimits();
 
+#ifndef _WIN32
 // 在 fork 之后、execve 之前调用。失败返回 false 并填 err。
 bool ApplyLimits(const Limits& l, std::string* err);
+#else
+/**
+ * 把上限装到 Job 对象上，在 AssignProcessToJobObject **之前**调用。
+ *
+ * ★ Windows 这边为什么根本不会重演 RLIMIT_NPROC 那个坑：
+ *   JOB_OBJECT_LIMIT_ACTIVE_PROCESS 数的是**这个 Job 里的进程**，
+ *   既不是全系统、也不按 UID、更不是线程。所以可以写死一个绝对值，
+ *   它只约束这一个 cell，本机跑着多少别的东西都不影响。
+ *   README 里「当前用量 + 512」那套相对算法是 Linux 特有的补丁，
+ *   不该也不需要照搬过来。
+ */
+bool ApplyLimitsToJob(void* job, const Limits& l, std::string* err);
+#endif
 
 }  // namespace hx

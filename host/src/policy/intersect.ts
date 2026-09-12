@@ -7,6 +7,7 @@
 //
 // Windows 里低完整性进程不能驱动高完整性进程的行为；这里是同一条规矩。
 import type { Rule } from "./rules.js";
+import { pathWithin } from "../platform.js";
 
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type NetMode = "deny" | "allow";
@@ -33,10 +34,15 @@ function tighterSandbox(a: SandboxMode, b: SandboxMode): SandboxMode {
   return SANDBOX_ORDER.indexOf(a) <= SANDBOX_ORDER.indexOf(b) ? a : b;
 }
 
-/** 路径是否落在某个 root 之内（按路径分量边界判断）。 */
-function within(path: string, root: string): boolean {
-  return path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`);
-}
+/**
+ * 路径是否落在某个 root 之内（按路径分量边界判断）。
+ *
+ * ★ 这不是字符串比较，是**权限判断**：它决定子 agent 申请的 root
+ *   算不算父 root 的子集。Windows 上分隔符两可、大小写不敏感，
+ *   按字节比的话子 agent 只要换个大小写就能"申请到"一个新 root。
+ *   具体见 platform.ts。
+ */
+const within = pathWithin;
 
 export interface IntersectResult {
   grant: Grant;

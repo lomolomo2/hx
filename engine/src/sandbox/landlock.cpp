@@ -1,5 +1,7 @@
 #include "sandbox/landlock.hpp"
 
+#include <memory>
+
 #include <fcntl.h>
 #include <linux/landlock.h>
 #include <sys/stat.h>
@@ -93,7 +95,7 @@ uint64_t FsAccessMaskForAbi(int abi) {
   return kReadAccess | WriteAccessForAbi(abi);
 }
 
-RulesetBuild BuildRulesetFd(const Policy& p, const Caps& caps) {
+RulesetBuild BuildConfinement(const Policy& p, const Caps& caps) {
   RulesetBuild out;
 
   if (p.sandbox == SandboxMode::kDangerFullAccess) {
@@ -126,25 +128,26 @@ RulesetBuild BuildRulesetFd(const Policy& p, const Caps& caps) {
                            " — NO filesystem isolation is in effect");
     return out;
   }
-  out.fd = static_cast<int>(fd);
+  out.conf = std::make_shared<Confinement>();
+  out.conf->fd = static_cast<int>(fd);
 
   // 只读：系统路径 + roots 都只给读
   // 可写：系统路径给读，roots / tmpdir / 设备节点给读写
   const uint64_t write_access = kReadAccess | WriteAccessForAbi(abi);
 
   for (const auto& path : DefaultSystemReadPaths()) {
-    GrantPath(out.fd, path, kReadAccess, &out.warnings);
+    GrantPath(out.conf->fd, path, kReadAccess, &out.warnings);
   }
 
   // 设备节点在任何模式下都要可写：写 /dev/null 是空操作，不是安全边界。
   // 少了它，read-only 会话里每条 shell 命令都会被 profile 脚本的
   // "/dev/null: Permission denied" 噪音污染 —— 白烧 token，还会误导模型。
   for (const auto& dev : DefaultWritableDevices()) {
-    GrantPath(out.fd, dev, write_access, &out.warnings);
+    GrantPath(out.conf->fd, dev, write_access, &out.warnings);
   }
 
   for (const auto& extra : p.extra_read_paths) {
-    if (!GrantPath(out.fd, extra, kReadAccess, &out.warnings)) {
+    if (!GrantPath(out.conf->fd, extra, kReadAccess, &out.warnings)) {
       out.warnings.push_back("extra read path not granted: " + extra);
     }
   }
@@ -152,21 +155,22 @@ RulesetBuild BuildRulesetFd(const Policy& p, const Caps& caps) {
   for (const auto& root : p.roots) {
     const uint64_t access =
         (p.sandbox == SandboxMode::kWorkspaceWrite) ? write_access : kReadAccess;
-    if (!GrantPath(out.fd, root, access, &out.warnings)) {
+    if (!GrantPath(out.conf->fd, root, access, &out.warnings)) {
       out.warnings.push_back("root not granted: " + root);
     }
   }
 
   if (p.sandbox == SandboxMode::kWorkspaceWrite && !p.tmpdir.empty()) {
-    GrantPath(out.fd, p.tmpdir, write_access, &out.warnings);
+    GrantPath(out.conf->fd, p.tmpdir, write_access, &out.warnings);
   }
 
   out.enforced = true;
   return out;
 }
 
-bool ApplyRestrictSelf(int ruleset_fd, std::string* err) {
-  if (ruleset_fd < 0) return true;  // 明确不施加
+bool ApplyRestrictSelf(const Confinement* conf, std::string* err) {
+  if (conf == nullptr || conf->fd < 0) return true;  // 明确不施加
+  const int ruleset_fd = conf->fd;
 
   // landlock_restrict_self 要求进程已设置 no_new_privs
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
