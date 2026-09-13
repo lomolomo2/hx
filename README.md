@@ -386,6 +386,10 @@ node scripts/transcript.mjs s6468 --full
 HX_LOG_PROMPTS=1 hx "..."   # then: transcript.mjs --prompts
 ```
 
+For a walk-through of what actually happens in a turn -- prompt assembly, how
+the reply is read, and one real run quoted from its rollout -- see
+**[docs/anatomy-of-a-turn.md](docs/anatomy-of-a-turn.md)**.
+
 It pairs each tool call with its result and renders the sandbox report,
 approvals, subagent grants and compactions. Note what a rollout does *not*
 hold: the exact text sent to the model. Each step's prompt is assembled fresh
@@ -499,6 +503,7 @@ host/
 hx.ps1, hx.cmd             the Windows launcher: add to PATH and type `hx` in any repo
 try-hx.ps1                 the Windows try-it entry point (-Caps / -Sandbox / -Repl / an offline task)
 scripts/transcript.mjs     read a rollout back as a readable transcript (node scripts/transcript.mjs --list)
+docs/anatomy-of-a-turn.md  what happens in one turn, with a real run quoted end to end
 ```
 
 **The principle for splitting by platform: select whole files, never scatter

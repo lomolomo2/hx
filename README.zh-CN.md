@@ -295,6 +295,9 @@ node scripts/transcript.mjs s6468 --full
 HX_LOG_PROMPTS=1 hx "..."   # 然后 transcript.mjs --prompts
 ```
 
+想看一轮里到底发生了什么——提示词怎么装配、回复怎么被读取、以及一次真实运行的
+逐字记录——见 **[docs/anatomy-of-a-turn.zh-CN.md](docs/anatomy-of-a-turn.zh-CN.md)**。
+
 它把每次工具调用和它的结果配好对，并渲染沙箱实况、审批、子 agent 授权与压缩。
 注意 rollout **不**包含每一步发给模型的原文：提示词是 `buildPrompt()` 当场装配的，
 从不落盘；记下来的是对话本身。
@@ -380,6 +383,7 @@ host/
 hx.ps1 · hx.cmd            Windows 启动器：加进 PATH 后在任意仓库里敲 `hx`
 try-hx.ps1                 Windows 试跑入口（-Caps / -Sandbox / -Repl / 离线任务）
 scripts/transcript.mjs     把 rollout 读成可读的对话记录（node scripts/transcript.mjs --list）
+docs/anatomy-of-a-turn.zh-CN.md  一轮里发生了什么，附一次真实运行的逐字记录
 ```
 
 **平台切分的原则：整个文件按平台挑，不在文件里撒 `#ifdef`。**
